@@ -1,12 +1,14 @@
-
 // ============================================================================
 // Activation Functions
 // ============================================================================
-
+use crate::autograd::tensor::TensorId;
 impl Tensor {
     /// `ReLU` activation: z = max(0, self)
     #[must_use]
     pub fn relu(&self) -> Tensor {
+        if self.is_transposed() {
+            return self.contiguous().relu();
+        }
         // Delegate to trueno's AVX2 SIMD relu with zero-copy allocation.
         // Contract: provable-contracts/contracts/activation-kernel-v1.yaml
         let data = trueno::blis::elementwise::relu_alloc(self.data());
@@ -29,6 +31,9 @@ impl Tensor {
     /// Sigmoid activation: z = 1 / (1 + exp(-self))
     #[must_use]
     pub fn sigmoid(&self) -> Tensor {
+        if self.is_transposed() {
+            return self.contiguous().sigmoid();
+        }
         let src = self.data();
         let n = src.len();
         let mut data = vec![0.0f32; n];
@@ -56,6 +61,9 @@ impl Tensor {
     /// Tanh activation
     #[must_use]
     pub fn tanh_(&self) -> Tensor {
+        if self.is_transposed() {
+            return self.contiguous().tanh_();
+        }
         let data: Vec<f32> = self.data().iter().map(|&a| a.tanh()).collect();
         let mut result = Tensor::from_vec(data, self.shape());
 
@@ -82,11 +90,18 @@ impl Tensor {
     /// * `negative_slope` - Controls the angle of the negative slope (default: 0.01)
     #[must_use]
     pub fn leaky_relu(&self, negative_slope: f32) -> Tensor {
+        if self.is_transposed() {
+            return self.contiguous().leaky_relu(negative_slope);
+        }
         let src = self.data();
         let n = src.len();
         let mut data = vec![0.0f32; n];
         for i in 0..n {
-            data[i] = if src[i] > 0.0 { src[i] } else { negative_slope * src[i] };
+            data[i] = if src[i] > 0.0 {
+                src[i]
+            } else {
+                negative_slope * src[i]
+            };
         }
         let mut result = Tensor::from_vec(data, self.shape());
 
@@ -113,6 +128,9 @@ impl Tensor {
     /// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
     #[must_use]
     pub fn gelu(&self) -> Tensor {
+        if self.is_transposed() {
+            return self.contiguous().gelu();
+        }
         let sqrt_2_over_pi = (2.0_f32 / std::f32::consts::PI).sqrt();
 
         let src = self.data();
@@ -146,6 +164,12 @@ impl Tensor {
     /// Uses numerically stable computation with max subtraction.
     #[must_use]
     pub fn softmax(&self) -> Tensor {
+        // Softmax operates along a dimension, so layout matters.
+        // Ensure data is contiguous for correct mapping.
+        if self.is_transposed() {
+            return self.contiguous().softmax();
+        }
+
         // ONE PATH: Computation delegates to nn::functional::softmax (UCBD §4).
         // Gradient tracking is handled here (autograd layer).
         let computed = crate::nn::functional::softmax(self, -1);
@@ -185,21 +209,34 @@ impl Tensor {
         assert_eq!(self.ndim(), 2, "matmul requires 2D tensors");
         assert_eq!(other.ndim(), 2, "matmul requires 2D tensors");
 
-        let (m, k1) = (self.shape()[0], self.shape()[1]);
-        let (k2, n) = (other.shape()[0], other.shape()[1]);
+        // Matmul requires contiguous memory for optimal performance with BLIS.
+        // If either tensor is transposed, make it contiguous.
+        let a = if self.is_transposed() {
+            self.contiguous()
+        } else {
+            self.clone()
+        };
+        let b = if other.is_transposed() {
+            other.contiguous()
+        } else {
+            other.clone()
+        };
+
+        let (m, k1) = (a.shape()[0], a.shape()[1]);
+        let (k2, n) = (b.shape()[0], b.shape()[1]);
         assert_eq!(k1, k2, "matmul dimension mismatch: {k1} vs {k2}");
 
         let data = if m == 1 {
             // GEMV fast path: call trueno's SIMD gemv directly on borrowed slices.
             // Avoids copying the K×N weight matrix (172MB at LLM scale).
             let mut c = vec![0.0f32; n];
-            trueno::blis::gemv::gemv(k1, n, self.data(), other.data(), &mut c);
+            trueno::blis::gemv::gemv(k1, n, a.data(), b.data(), &mut c);
             c
         } else {
             // General matmul via trueno Matrix (copies data for Matrix ownership)
-            let a_matrix = trueno::Matrix::from_vec(m, k1, self.data().to_vec())
+            let a_matrix = trueno::Matrix::from_vec(m, k1, a.data().to_vec())
                 .expect("valid matrix dimensions");
-            let b_matrix = trueno::Matrix::from_vec(k2, n, other.data().to_vec())
+            let b_matrix = trueno::Matrix::from_vec(k2, n, b.data().to_vec())
                 .expect("valid matrix dimensions");
             let result_matrix = a_matrix.matmul(&b_matrix).expect("matmul should succeed");
             result_matrix.as_slice().to_vec()
@@ -236,18 +273,15 @@ impl Tensor {
     /// ```
     #[must_use]
     pub fn transpose(&self) -> Tensor {
-        assert_eq!(self.ndim(), 2, "transpose requires 2D tensor");
+        assert!(self.ndim() >= 2, "transpose requires at least 2D tensor");
 
-        let (rows, cols) = (self.shape()[0], self.shape()[1]);
-        let src = self.data();
-        let mut data = vec![0.0; rows * cols];
+        let mut result = self.clone();
 
-        // Delegate to trueno's AVX2 8×8 in-register transpose.
-        // Contract: provable-contracts/contracts/transpose-kernel-v1.yaml
-        trueno::blis::transpose::transpose(rows, cols, src, &mut data)
-            .expect("transpose: dimension mismatch (should be impossible)");
-
-        let mut result = Tensor::from_vec(data, &[cols, rows]);
+        // Lazy Transpose: swap last two dimensions and flip flag
+        let ndim = result.shape.len();
+        result.shape.swap(ndim - 1, ndim - 2);
+        result.is_transposed = !self.is_transposed;
+        result.id = TensorId::new();
 
         if is_grad_enabled() && self.requires_grad_enabled() {
             result.requires_grad_(true);
@@ -284,6 +318,9 @@ impl Tensor {
     /// ```
     #[must_use]
     pub fn broadcast_add(&self, other: &Tensor) -> Tensor {
+        if self.is_transposed() {
+            return self.contiguous().broadcast_add(other);
+        }
         assert_eq!(self.ndim(), 2, "broadcast_add requires 2D matrix");
         assert_eq!(other.ndim(), 1, "broadcast_add requires 1D vector");
         assert_eq!(
@@ -336,6 +373,9 @@ impl Tensor {
     /// ```
     #[must_use]
     pub fn view(&self, new_shape: &[usize]) -> Tensor {
+        if self.is_transposed() {
+            return self.contiguous().view(new_shape);
+        }
         let old_numel: usize = self.shape().iter().product();
         let new_numel: usize = new_shape.iter().product();
         assert_eq!(

@@ -307,7 +307,12 @@ impl Module for RMSNorm {
         } else {
             // Non-affine: normalize without weight
             let batch_dims: usize = shape[..start_dim].iter().product();
-            let input_data = input.data();
+            let input_contiguous = if input.is_transposed() {
+                input.contiguous()
+            } else {
+                input.clone()
+            };
+            let input_data = input_contiguous.data();
             let mut output_data = vec![0.0; input_data.len()];
 
             for b in 0..batch_dims {

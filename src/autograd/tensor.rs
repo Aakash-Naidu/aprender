@@ -48,11 +48,11 @@ impl Default for TensorId {
 /// making them safe to share across threads for inference (but not training).
 #[derive(Clone)]
 pub struct Tensor {
-    /// Underlying data storage
-    data: Vector<f32>,
+    /// Underlying data storage (shared via Arc for zero-copy cloning)
+    pub(crate) data: Arc<Vector<f32>>,
 
     /// Shape of the tensor
-    shape: Vec<usize>,
+    pub(crate) shape: Vec<usize>,
 
     /// Gradient (populated after `backward()`)
     grad: Option<Box<Tensor>>,
@@ -67,7 +67,10 @@ pub struct Tensor {
     grad_fn: Option<Arc<dyn GradFn>>,
 
     /// Unique identifier for graph construction
-    id: TensorId,
+    pub(crate) id: TensorId,
+
+    /// Whether the tensor is currently transposed (Lazy Transpose)
+    pub(crate) is_transposed: bool,
 }
 
 impl Tensor {
@@ -91,13 +94,14 @@ impl Tensor {
         );
 
         Self {
-            data: Vector::from_slice(data),
+            data: Arc::new(Vector::from_slice(data)),
             shape: shape.to_vec(),
             grad: None,
             requires_grad: false,
             is_leaf: true,
             grad_fn: None,
             id: TensorId::new(),
+            is_transposed: false,
         }
     }
 
@@ -118,13 +122,14 @@ impl Tensor {
         );
 
         Self {
-            data: Vector::from_vec(data),
+            data: Arc::new(Vector::from_vec(data)),
             shape: shape.to_vec(),
             grad: None,
             requires_grad: false,
             is_leaf: true,
             grad_fn: None,
             id: TensorId::new(),
+            is_transposed: false,
         }
     }
 
@@ -212,6 +217,11 @@ impl Tensor {
     }
 
     /// Get a reference to the underlying data.
+    ///
+    /// # Warning
+    ///
+    /// If `is_transposed()` is true, the data is not in the expected order
+    /// for the current shape. Call `contiguous()` if you need a physical layout.
     #[must_use]
     pub fn data(&self) -> &[f32] {
         self.data.as_slice()
@@ -222,8 +232,10 @@ impl Tensor {
     /// # Warning
     ///
     /// Modifying data directly may invalidate gradients.
+    /// If `is_transposed()` is true, the data is not in the expected order.
+    /// This method uses Copy-on-Write (CoW) to ensure other clones are unaffected.
     pub fn data_mut(&mut self) -> &mut [f32] {
-        self.data.as_mut_slice()
+        Arc::make_mut(&mut self.data).as_mut_slice()
     }
 
     /// Get the gradient tensor (if computed).
@@ -246,14 +258,12 @@ impl Tensor {
     pub(crate) fn accumulate_grad(&mut self, grad: Tensor) {
         match &mut self.grad {
             Some(existing) => {
-                // Accumulate gradients
-                let new_data: Vec<f32> = existing
-                    .data()
-                    .iter()
-                    .zip(grad.data().iter())
-                    .map(|(a, b)| a + b)
-                    .collect();
-                **existing = Tensor::new(&new_data, &self.shape);
+                // Accumulate gradients in-place if possible (CoW)
+                let other_data = grad.data();
+                let self_data = existing.data_mut();
+                for i in 0..self_data.len() {
+                    self_data[i] += other_data[i];
+                }
             }
             None => {
                 self.grad = Some(Box::new(grad));
@@ -261,10 +271,53 @@ impl Tensor {
         }
     }
 
+    /// Ensure the tensor data is contiguous in memory.
+    ///
+    /// If the tensor is lazily transposed, this will perform a physical
+    /// transpose and return a new tensor with the correct layout.
+    #[must_use]
+    pub fn contiguous(&self) -> Tensor {
+        if !self.is_transposed {
+            return self.clone();
+        }
+
+        let ndim = self.ndim();
+        let rows = self.shape[ndim - 2];
+        let cols = self.shape[ndim - 1];
+        let batch_size: usize = self.shape[0..ndim - 2].iter().product();
+        let mut data = vec![0.0; self.numel()];
+
+        let matrix_size = rows * cols;
+        for b in 0..batch_size {
+            let offset = b * matrix_size;
+            // Original dimensions were (cols, rows)
+            trueno::blis::transpose::transpose(
+                cols,
+                rows,
+                &self.data.as_slice()[offset..offset + matrix_size],
+                &mut data[offset..offset + matrix_size],
+            )
+            .expect("contiguous: transpose failed");
+        }
+
+        let mut result = Tensor::from_vec(data, &self.shape);
+        result.requires_grad = self.requires_grad;
+        result.is_leaf = self.is_leaf;
+        result.grad_fn = self.grad_fn.clone();
+
+        result
+    }
+
     /// Set the gradient function (used internally by operations).
     pub(crate) fn set_grad_fn(&mut self, grad_fn: Arc<dyn GradFn>) {
         self.grad_fn = Some(grad_fn);
         self.is_leaf = false;
+    }
+
+    /// Check if the tensor is lazily transposed.
+    #[must_use]
+    pub fn is_transposed(&self) -> bool {
+        self.is_transposed
     }
 
     /// Get the gradient function.
@@ -286,6 +339,7 @@ impl Tensor {
             is_leaf: true,
             grad_fn: None,
             id: TensorId::new(),
+            is_transposed: self.is_transposed,
         }
     }
 

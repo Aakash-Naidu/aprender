@@ -1,0 +1,24 @@
+version: 1
+
+kernel:
+  name: transpose
+  id: transpose-kernel-v1
+  library: aprender
+
+description: >
+  Lazy transpose implementation. The operation swaps the last two
+  tensor dimensions by modifying metadata only. No data copy occurs
+  unless a contiguous layout is requested.
+
+semantics:
+  operation: transpose
+  axes: last_two
+
+performance:
+  complexity: O(1)
+  memory_copy: false
+
+fallback:
+  operation: contiguous
+  description: >
+    Physical transpose occurs only when contiguous layout is required.

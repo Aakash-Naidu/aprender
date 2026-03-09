@@ -42,7 +42,11 @@ pub fn leaky_relu(x: &Tensor, negative_slope: f32) -> Tensor {
     let n = src.len();
     let mut data = vec![0.0f32; n];
     for i in 0..n {
-        data[i] = if src[i] > 0.0 { src[i] } else { negative_slope * src[i] };
+        data[i] = if src[i] > 0.0 {
+            src[i]
+        } else {
+            negative_slope * src[i]
+        };
     }
     Tensor::from_vec(data, x.shape())
 }
@@ -112,6 +116,9 @@ pub fn silu_scalar(x: f32) -> f32 {
 // Contract: swiglu-kernel-v1, equation = "swiglu"
 #[must_use]
 pub fn swiglu(x: &Tensor, gate: &Tensor) -> Tensor {
+    if x.is_transposed() || gate.is_transposed() {
+        return swiglu(&x.contiguous(), &gate.contiguous());
+    }
     let src_x = x.data();
     let src_g = gate.data();
     let n = src_x.len();
@@ -339,6 +346,9 @@ pub fn dropout(x: &Tensor, p: f32, training: bool) -> Tensor {
 /// Contract: layernorm-kernel-v1, equation "layernorm"
 #[must_use]
 pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Tensor {
+    if x.is_transposed() {
+        return layer_norm(&x.contiguous(), weight, bias, eps);
+    }
     let shape = x.shape();
     let data = x.data();
     let weight_data = weight.data();
@@ -381,6 +391,9 @@ pub fn layer_norm(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Tenso
 /// Contract: rmsnorm-kernel-v1, equation "rmsnorm"
 #[must_use]
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
+    if x.is_transposed() {
+        return rms_norm(&x.contiguous(), weight, eps);
+    }
     let shape = x.shape();
     let data = x.data();
     let weight_data = weight.data();

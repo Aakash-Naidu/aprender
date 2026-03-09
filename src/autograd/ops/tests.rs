@@ -24,7 +24,6 @@ where
     Tensor::new(&grad_data, x.shape())
 }
 
-
 pub(super) fn check_gradient<F>(f: F, x: &Tensor, eps: f32, tol: f32) -> bool
 where
     F: Fn(&Tensor) -> Tensor,
@@ -421,7 +420,8 @@ fn test_transpose_forward() {
     assert_eq!(a_t.shape(), &[3, 2]);
     // Original: [[1, 2, 3], [4, 5, 6]]
     // Transposed: [[1, 4], [2, 5], [3, 6]]
-    assert_eq!(a_t.data(), &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    // Use .contiguous() to see physical layout
+    assert_eq!(a_t.contiguous().data(), &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 }
 
 #[test]
@@ -443,6 +443,48 @@ fn test_broadcast_add_forward() {
     let result = matrix.broadcast_add(&bias);
     // [[1+10, 2+20], [3+10, 4+20]] = [[11, 22], [13, 24]]
     assert_eq!(result.data(), &[11.0, 22.0, 13.0, 24.0]);
+}
+
+#[test]
+fn test_double_transpose() {
+    let a = Tensor::new(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    let a_t = a.transpose();
+    let a_t_t = a_t.transpose();
+
+    assert_eq!(a_t_t.shape(), &[2, 3]);
+    assert_eq!(a_t_t.contiguous().data(), a.data());
+}
+
+#[test]
+fn test_transpose_nd() {
+    // 3D tensor: batch=2, rows=2, cols=3
+    let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+    let a = Tensor::new(&data, &[2, 2, 3]);
+    let a_t = a.transpose();
+
+    assert_eq!(a_t.shape(), &[2, 3, 2]);
+    // The contiguous operation should transpose each 2x3 matrix independently
+    let expected = vec![
+        1.0, 4.0, 2.0, 5.0, 3.0, 6.0, // Batch 0
+        7.0, 10.0, 8.0, 11.0, 9.0, 12.0, // Batch 1
+    ];
+    assert_eq!(a_t.contiguous().data(), expected.as_slice());
+}
+
+#[test]
+fn test_mixed_operations_transposed() {
+    let a = Tensor::new(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).transpose(); // [[1, 3], [2, 4]]
+    let b = Tensor::new(&[1.0, 1.0, 1.0, 1.0], &[2, 2]);
+
+    // A.t() + B
+    // [[1, 3], [2, 4]] + [[1, 1], [1, 1]] = [[2, 4], [3, 5]]
+    let c = a.add(&b);
+    assert_eq!(c.contiguous().data(), &[2.0, 4.0, 3.0, 5.0]);
+
+    // A.t() * B
+    // [[1, 3], [2, 4]] * [[1, 1], [1, 1]] = [[1, 3], [2, 4]]
+    let d = a.mul(&b);
+    assert_eq!(d.contiguous().data(), &[1.0, 3.0, 2.0, 4.0]);
 }
 
 #[path = "tests_broadcast_ops.rs"]
