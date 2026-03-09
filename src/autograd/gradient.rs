@@ -1,4 +1,3 @@
-
 impl GradFn for CrossEntropyBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         let (batch, num_classes) = (
@@ -38,13 +37,23 @@ pub(crate) struct SigmoidBackward {
 impl GradFn for SigmoidBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂sigmoid(x)/∂x = sigmoid(x) * (1 - sigmoid(x))
-        let grad_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let out = if self.output.is_transposed() {
+            self.output.contiguous()
+        } else {
+            self.output.clone()
+        };
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.output.data().iter())
+            .zip(out.data().iter())
             .map(|(&g, &s)| g * s * (1.0 - s))
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -60,13 +69,23 @@ pub(crate) struct TanhBackward {
 impl GradFn for TanhBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂tanh(x)/∂x = 1 - tanh²(x)
-        let grad_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let out = if self.output.is_transposed() {
+            self.output.contiguous()
+        } else {
+            self.output.clone()
+        };
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.output.data().iter())
+            .zip(out.data().iter())
             .map(|(&g, &t)| g * (1.0 - t * t))
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -159,12 +178,18 @@ impl GradFn for MatmulBackward {
 
 /// Reduce gradient to scalar by summing all elements.
 fn reduce_to_scalar(grad: &Tensor, target_shape: &[usize]) -> Tensor {
+    // Sum is layout-independent
     let sum: f32 = grad.data().iter().sum();
     Tensor::new(&[sum], target_shape)
 }
 
 /// Reduce 2D gradient to 1D by summing over batch dimension.
 fn reduce_batch_to_features(grad: &Tensor, target_shape: &[usize]) -> Tensor {
+    let grad = if grad.is_transposed() {
+        grad.contiguous()
+    } else {
+        grad.clone()
+    };
     let (rows, cols) = (grad.shape()[0], grad.shape()[1]);
     let mut reduced = vec![0.0; cols];
     let grad_data = grad.data();
@@ -199,7 +224,13 @@ fn maybe_reduce_grad(grad: &Tensor, target_shape: &[usize]) -> Tensor {
 
     // If shapes match in size, just reshape
     if grad.numel() == target_shape.iter().product::<usize>() {
-        return Tensor::new(grad.data(), target_shape);
+        // Must be contiguous for reshape by indexing
+        let g = if grad.is_transposed() {
+            grad.contiguous()
+        } else {
+            grad.clone()
+        };
+        return Tensor::new(g.data(), target_shape);
     }
 
     grad.clone()

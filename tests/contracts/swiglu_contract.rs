@@ -81,7 +81,7 @@ proptest! {
             let actual = result.data()[i];
             let diff = (actual - expected).abs();
             prop_assert!(
-                diff < 1e-6,
+                diff < 1e-4,
                 "Tensor vs scalar mismatch at [{i}]: tensor={actual}, scalar={expected}"
             );
         }

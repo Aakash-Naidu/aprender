@@ -6,12 +6,14 @@ impl Tensor {
     /// `ReLU` activation: z = max(0, self)
     #[must_use]
     pub fn relu(&self) -> Tensor {
-        if self.is_transposed() {
-            return self.contiguous().relu();
-        }
+        let a = if self.is_transposed() {
+            self.contiguous()
+        } else {
+            self.clone()
+        };
         // Delegate to trueno's AVX2 SIMD relu with zero-copy allocation.
         // Contract: provable-contracts/contracts/activation-kernel-v1.yaml
-        let data = trueno::blis::elementwise::relu_alloc(self.data());
+        let data = trueno::blis::elementwise::relu_alloc(a.data());
         let mut result = Tensor::from_vec(data, self.shape());
 
         if is_grad_enabled() && self.requires_grad_enabled() {
@@ -31,10 +33,12 @@ impl Tensor {
     /// Sigmoid activation: z = 1 / (1 + exp(-self))
     #[must_use]
     pub fn sigmoid(&self) -> Tensor {
-        if self.is_transposed() {
-            return self.contiguous().sigmoid();
-        }
-        let src = self.data();
+        let a = if self.is_transposed() {
+            self.contiguous()
+        } else {
+            self.clone()
+        };
+        let src = a.data();
         let n = src.len();
         let mut data = vec![0.0f32; n];
         for i in 0..n {
@@ -61,10 +65,12 @@ impl Tensor {
     /// Tanh activation
     #[must_use]
     pub fn tanh_(&self) -> Tensor {
-        if self.is_transposed() {
-            return self.contiguous().tanh_();
-        }
-        let data: Vec<f32> = self.data().iter().map(|&a| a.tanh()).collect();
+        let a = if self.is_transposed() {
+            self.contiguous()
+        } else {
+            self.clone()
+        };
+        let data: Vec<f32> = a.data().iter().map(|&a| a.tanh()).collect();
         let mut result = Tensor::from_vec(data, self.shape());
 
         if is_grad_enabled() && self.requires_grad_enabled() {
@@ -90,10 +96,12 @@ impl Tensor {
     /// * `negative_slope` - Controls the angle of the negative slope (default: 0.01)
     #[must_use]
     pub fn leaky_relu(&self, negative_slope: f32) -> Tensor {
-        if self.is_transposed() {
-            return self.contiguous().leaky_relu(negative_slope);
-        }
-        let src = self.data();
+        let a = if self.is_transposed() {
+            self.contiguous()
+        } else {
+            self.clone()
+        };
+        let src = a.data();
         let n = src.len();
         let mut data = vec![0.0f32; n];
         for i in 0..n {
@@ -128,12 +136,14 @@ impl Tensor {
     /// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
     #[must_use]
     pub fn gelu(&self) -> Tensor {
-        if self.is_transposed() {
-            return self.contiguous().gelu();
-        }
+        let a = if self.is_transposed() {
+            self.contiguous()
+        } else {
+            self.clone()
+        };
         let sqrt_2_over_pi = (2.0_f32 / std::f32::consts::PI).sqrt();
 
-        let src = self.data();
+        let src = a.data();
         let n = src.len();
         let mut data = vec![0.0f32; n];
         for i in 0..n {
@@ -318,25 +328,33 @@ impl Tensor {
     /// ```
     #[must_use]
     pub fn broadcast_add(&self, other: &Tensor) -> Tensor {
-        if self.is_transposed() {
-            return self.contiguous().broadcast_add(other);
-        }
-        assert_eq!(self.ndim(), 2, "broadcast_add requires 2D matrix");
-        assert_eq!(other.ndim(), 1, "broadcast_add requires 1D vector");
+        let a = if self.is_transposed() {
+            self.contiguous()
+        } else {
+            self.clone()
+        };
+        let b = if other.is_transposed() {
+            other.contiguous()
+        } else {
+            other.clone()
+        };
+
+        assert_eq!(a.ndim(), 2, "broadcast_add requires 2D matrix");
+        assert_eq!(b.ndim(), 1, "broadcast_add requires 1D vector");
         assert_eq!(
-            self.shape()[1],
-            other.shape()[0],
+            a.shape()[1],
+            b.shape()[0],
             "Matrix columns {} must match vector length {}",
-            self.shape()[1],
-            other.shape()[0]
+            a.shape()[1],
+            b.shape()[0]
         );
 
-        let (rows, cols) = (self.shape()[0], self.shape()[1]);
+        let (rows, cols) = (a.shape()[0], a.shape()[1]);
         let mut data = vec![0.0; rows * cols];
 
         for i in 0..rows {
             for j in 0..cols {
-                data[i * cols + j] = self.data()[i * cols + j] + other.data()[j];
+                data[i * cols + j] = a.data()[i * cols + j] + b.data()[j];
             }
         }
 
@@ -373,10 +391,12 @@ impl Tensor {
     /// ```
     #[must_use]
     pub fn view(&self, new_shape: &[usize]) -> Tensor {
-        if self.is_transposed() {
-            return self.contiguous().view(new_shape);
-        }
-        let old_numel: usize = self.shape().iter().product();
+        let a = if self.is_transposed() {
+            self.contiguous()
+        } else {
+            self.clone()
+        };
+        let old_numel: usize = a.shape().iter().product();
         let new_numel: usize = new_shape.iter().product();
         assert_eq!(
             old_numel, new_numel,

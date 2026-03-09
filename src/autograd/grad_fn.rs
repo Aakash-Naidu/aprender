@@ -71,8 +71,13 @@ impl GradFn for SubBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂(x-y)/∂x = 1, ∂(x-y)/∂y = -1
         let grad_x = maybe_reduce_grad(grad_output, &self.x_shape);
-        let grad_y_data: Vec<f32> = grad_output.data().iter().map(|&g| -g).collect();
-        let grad_y_full = Tensor::new(&grad_y_data, grad_output.shape());
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let grad_y_data: Vec<f32> = g.data().iter().map(|&g| -g).collect();
+        let grad_y_full = Tensor::new(&grad_y_data, g.shape());
         let grad_y = maybe_reduce_grad(&grad_y_full, &self.y_shape);
         vec![grad_x, grad_y]
     }
@@ -91,27 +96,37 @@ pub(crate) struct MulBackward {
 impl GradFn for MulBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂(x*y)/∂x = y, ∂(x*y)/∂y = x
-        let grad_x_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let x = if self.x.is_transposed() {
+            self.x.contiguous()
+        } else {
+            self.x.clone()
+        };
+        let y = if self.y.is_transposed() {
+            self.y.contiguous()
+        } else {
+            self.y.clone()
+        };
+
+        let grad_x_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.y.data().iter())
+            .zip(y.data().iter())
             .map(|(&g, &y)| g * y)
             .collect();
-        let grad_y_data: Vec<f32> = grad_output
+        let grad_y_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.x.data().iter())
+            .zip(x.data().iter())
             .map(|(&g, &x)| g * x)
             .collect();
 
-        let grad_x = maybe_reduce_grad(
-            &Tensor::new(&grad_x_data, grad_output.shape()),
-            self.x.shape(),
-        );
-        let grad_y = maybe_reduce_grad(
-            &Tensor::new(&grad_y_data, grad_output.shape()),
-            self.y.shape(),
-        );
+        let grad_x = maybe_reduce_grad(&Tensor::new(&grad_x_data, g.shape()), self.x.shape());
+        let grad_y = maybe_reduce_grad(&Tensor::new(&grad_y_data, g.shape()), self.y.shape());
         vec![grad_x, grad_y]
     }
 
@@ -129,28 +144,38 @@ pub(crate) struct DivBackward {
 impl GradFn for DivBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂(x/y)/∂x = 1/y, ∂(x/y)/∂y = -x/y²
-        let grad_x_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let x = if self.x.is_transposed() {
+            self.x.contiguous()
+        } else {
+            self.x.clone()
+        };
+        let y = if self.y.is_transposed() {
+            self.y.contiguous()
+        } else {
+            self.y.clone()
+        };
+
+        let grad_x_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.y.data().iter())
+            .zip(y.data().iter())
             .map(|(&g, &y)| g / y)
             .collect();
-        let grad_y_data: Vec<f32> = grad_output
+        let grad_y_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.x.data().iter())
-            .zip(self.y.data().iter())
+            .zip(x.data().iter())
+            .zip(y.data().iter())
             .map(|((&g, &x), &y)| -g * x / (y * y))
             .collect();
 
-        let grad_x = maybe_reduce_grad(
-            &Tensor::new(&grad_x_data, grad_output.shape()),
-            self.x.shape(),
-        );
-        let grad_y = maybe_reduce_grad(
-            &Tensor::new(&grad_y_data, grad_output.shape()),
-            self.y.shape(),
-        );
+        let grad_x = maybe_reduce_grad(&Tensor::new(&grad_x_data, g.shape()), self.x.shape());
+        let grad_y = maybe_reduce_grad(&Tensor::new(&grad_y_data, g.shape()), self.y.shape());
         vec![grad_x, grad_y]
     }
 
@@ -165,8 +190,13 @@ pub(crate) struct NegBackward;
 impl GradFn for NegBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂(-x)/∂x = -1
-        let grad_data: Vec<f32> = grad_output.data().iter().map(|&g| -g).collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let grad_data: Vec<f32> = g.data().iter().map(|&g| -g).collect();
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -186,13 +216,23 @@ pub(crate) struct ExpBackward {
 impl GradFn for ExpBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂exp(x)/∂x = exp(x)
-        let grad_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let out = if self.output.is_transposed() {
+            self.output.contiguous()
+        } else {
+            self.output.clone()
+        };
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.output.data().iter())
+            .zip(out.data().iter())
             .map(|(&g, &exp_x)| g * exp_x)
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -208,13 +248,23 @@ pub(crate) struct LogBackward {
 impl GradFn for LogBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂log(x)/∂x = 1/x
-        let grad_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let x = if self.x.is_transposed() {
+            self.x.contiguous()
+        } else {
+            self.x.clone()
+        };
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.x.data().iter())
+            .zip(x.data().iter())
             .map(|(&g, &x)| g / x)
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -231,13 +281,23 @@ pub(crate) struct PowBackward {
 impl GradFn for PowBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂(x^n)/∂x = n * x^(n-1)
-        let grad_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let x = if self.x.is_transposed() {
+            self.x.contiguous()
+        } else {
+            self.x.clone()
+        };
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.x.data().iter())
+            .zip(x.data().iter())
             .map(|(&g, &x)| g * self.n * x.powf(self.n - 1.0))
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -253,13 +313,23 @@ pub(crate) struct SqrtBackward {
 impl GradFn for SqrtBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂sqrt(x)/∂x = 0.5 / sqrt(x)
-        let grad_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let out = if self.output.is_transposed() {
+            self.output.contiguous()
+        } else {
+            self.output.clone()
+        };
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.output.data().iter())
+            .zip(out.data().iter())
             .map(|(&g, &sqrt_x)| g * 0.5 / sqrt_x)
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -321,13 +391,23 @@ pub(crate) struct ReluBackward {
 impl GradFn for ReluBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂relu(x)/∂x = 1 if x > 0, else 0
-        let grad_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let x = if self.x.is_transposed() {
+            self.x.contiguous()
+        } else {
+            self.x.clone()
+        };
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.x.data().iter())
+            .zip(x.data().iter())
             .map(|(&g, &x)| if x > 0.0 { g } else { 0.0 })
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -344,13 +424,23 @@ pub(crate) struct LeakyReluBackward {
 impl GradFn for LeakyReluBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
         // ∂leaky_relu(x)/∂x = 1 if x > 0, else negative_slope
-        let grad_data: Vec<f32> = grad_output
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let x = if self.x.is_transposed() {
+            self.x.contiguous()
+        } else {
+            self.x.clone()
+        };
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.x.data().iter())
+            .zip(x.data().iter())
             .map(|(&g, &x)| if x > 0.0 { g } else { g * self.negative_slope })
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {
@@ -366,16 +456,22 @@ pub(crate) struct GeluBackward {
 
 impl GradFn for GeluBackward {
     fn backward(&self, grad_output: &Tensor) -> Vec<Tensor> {
-        // GELU gradient approximation (same as PyTorch's tanh approximation)
-        // d/dx[GELU(x)] ≈ 0.5 * (1 + tanh(inner)) + 0.5 * x * (1 - tanh²(inner)) * inner'
-        // where inner = sqrt(2/π) * (x + 0.044715 * x³)
-        // and inner' = sqrt(2/π) * (1 + 3 * 0.044715 * x²)
+        let g = if grad_output.is_transposed() {
+            grad_output.contiguous()
+        } else {
+            grad_output.clone()
+        };
+        let x = if self.x.is_transposed() {
+            self.x.contiguous()
+        } else {
+            self.x.clone()
+        };
         let sqrt_2_over_pi = (2.0_f32 / std::f32::consts::PI).sqrt();
 
-        let grad_data: Vec<f32> = grad_output
+        let grad_data: Vec<f32> = g
             .data()
             .iter()
-            .zip(self.x.data().iter())
+            .zip(x.data().iter())
             .map(|(&g, &x)| {
                 let inner = sqrt_2_over_pi * (x + 0.044715 * x.powi(3));
                 let tanh_inner = inner.tanh();
@@ -385,7 +481,7 @@ impl GradFn for GeluBackward {
                 g * gelu_deriv
             })
             .collect();
-        vec![Tensor::new(&grad_data, grad_output.shape())]
+        vec![Tensor::new(&grad_data, g.shape())]
     }
 
     fn name(&self) -> &'static str {

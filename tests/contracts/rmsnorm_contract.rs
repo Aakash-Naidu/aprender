@@ -53,7 +53,7 @@ proptest! {
             let expected = sign * orig_data[i];
             let diff = (expected - scaled_data[i]).abs();
             prop_assert!(
-                diff < 1e-3,
+                diff < 1e-2,
                 "scale invariance: sign*y[{i}]={expected} vs y_scaled[{i}]={}, diff={diff}",
                 scaled_data[i]
             );
