@@ -1,16 +1,20 @@
 use crate::error::Result;
 use std::path::{Path, PathBuf};
 
-/// Explain command - provides documentation about errors, tensors, and models.
+/// Explain command - provides documentation about errors, tensors, kernels, and models.
 ///
 /// The positional argument is auto-detected: if it looks like a file path
 /// (exists on disk or has a model file extension), it's treated as `--file`.
-/// Otherwise it's treated as an error code.
-#[allow(clippy::unnecessary_wraps)]
+/// Otherwise it's treated as an error code or family name.
+#[allow(clippy::unnecessary_wraps, clippy::fn_params_excessive_bools)]
 pub(crate) fn run(
     code_or_file: Option<String>,
     file: Option<PathBuf>,
     tensor: Option<&str>,
+    kernel: bool,
+    json: bool,
+    verbose: bool,
+    proof_status: bool,
 ) -> Result<()> {
     // Auto-detect: is the positional argument a file path or an error code?
     let (code, resolved_file) = match code_or_file {
@@ -25,6 +29,16 @@ pub(crate) fn run(
         None => (None, file),
     };
 
+    if kernel {
+        return explain_kernel(
+            code.as_deref(),
+            resolved_file.as_deref(),
+            json,
+            verbose,
+            proof_status,
+        );
+    }
+
     if let Some(c) = code {
         explain_error_code(&c);
     } else if let Some(t) = tensor {
@@ -32,13 +46,262 @@ pub(crate) fn run(
     } else if let Some(ref f) = resolved_file {
         explain_file(f);
     } else {
-        println!("Please provide an error code, model file path, or --tensor");
+        println!("Please provide an error code, model file path, or --tensor/--kernel");
         println!();
         println!("Usage:");
         println!("  apr explain E001              # explain error code");
         println!("  apr explain model.gguf        # explain model architecture");
         println!("  apr explain --tensor q_proj    # explain tensor role");
+        println!("  apr explain --kernel qwen2     # explain kernel dispatch");
+        println!("  apr explain --kernel model.apr # explain kernel from model file");
     }
+    Ok(())
+}
+
+/// Emit a kernel error message, respecting --json mode.
+fn emit_kernel_error(json_mode: bool, msg: &str) {
+    if json_mode {
+        let err = serde_json::json!({ "error": msg });
+        println!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+    } else {
+        eprintln!("Error: {msg}");
+    }
+}
+
+/// Kernel explainability: resolve family and display kernel dispatch pipeline.
+fn explain_kernel(
+    code_or_family: Option<&str>,
+    file: Option<&Path>,
+    json: bool,
+    verbose: bool,
+    proof_status: bool,
+) -> Result<()> {
+    use super::kernel_explain::*;
+
+    // Resolution chain: file → config.json → family string
+    let family = if let Some(path) = file {
+        // Validate file exists and is readable before attempting resolution
+        if !path.exists() {
+            eprintln!("Error: File not found: {}", path.display());
+            std::process::exit(1);
+        }
+        if path.is_dir() {
+            eprintln!(
+                "Error: '{}' is a directory, not a file. Provide a config.json or model file.",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+        if path.extension().map_or(false, |e| e == "json") {
+            // Direct config.json — validate it's parseable
+            let result = resolve_from_config_json(path);
+            if result.is_none() {
+                // File exists but couldn't resolve — check why
+                match std::fs::read_to_string(path) {
+                    Ok(content) => {
+                        let trimmed = content.trim();
+                        if trimmed.is_empty() {
+                            emit_kernel_error(json, &format!("'{}' is empty", path.display()));
+                        } else if trimmed.starts_with('[') {
+                            emit_kernel_error(json, &format!(
+                                "'{}' is a JSON array, not a JSON object. config.json must be a JSON object.",
+                                path.display()
+                            ));
+                        } else if !content.contains('{') {
+                            emit_kernel_error(
+                                json,
+                                &format!("'{}' is not valid JSON", path.display()),
+                            );
+                        } else {
+                            // Check if model_type field exists but is unrecognized
+                            let model_type = extract_json_string(&content, "model_type");
+                            if let Some(mt) = model_type {
+                                emit_kernel_error(
+                                    json,
+                                    &format!(
+                                        "Unknown model_type '{}' in '{}'. \
+                                     Run `apr explain --kernel` for supported families.",
+                                        mt,
+                                        path.display()
+                                    ),
+                                );
+                            } else {
+                                // Check if architectures field exists as fallback hint
+                                let has_arch = content.contains("\"architectures\"");
+                                let msg = if has_arch {
+                                    format!(
+                                        "No \"model_type\" field in '{}'. \
+                                         Found \"architectures\" but could not resolve family from it.",
+                                        path.display()
+                                    )
+                                } else {
+                                    format!(
+                                        "No \"model_type\" field in '{}'. \
+                                         Ensure the file is a HuggingFace config.json.",
+                                        path.display()
+                                    )
+                                };
+                                emit_kernel_error(json, &msg);
+                            }
+                        }
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        emit_kernel_error(
+                            json,
+                            &format!("Could not read '{}': {e}", path.display()),
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            result
+        } else {
+            // Model file — try to find config.json in same directory
+            // Also try resolving symlinks first for symlinked model files
+            let real_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let config_path = real_path.with_file_name("config.json");
+            if config_path.exists() {
+                resolve_from_config_json(&config_path)
+            } else {
+                emit_kernel_error(
+                    json,
+                    &format!(
+                        "No config.json found alongside '{}'. \
+                         Kernel analysis requires a HuggingFace config.json in the same directory.",
+                        path.display()
+                    ),
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let family = family.or_else(|| {
+        code_or_family.and_then(|input| {
+            // Try as HF repo pattern (e.g., "hf://Qwen/Qwen2.5-Coder-1.5B")
+            let input = input.strip_prefix("hf://").unwrap_or(input).trim();
+            // Try as config.json path
+            let path = Path::new(input);
+            if path.exists() && path.extension().map_or(false, |e| e == "json") {
+                return resolve_from_config_json(path);
+            }
+            // Try as HF repo ID → look up cached config.json
+            if input.contains('/') {
+                // Reject path traversal (defense in depth)
+                if input.contains("..") {
+                    return None;
+                }
+                let cache_base = dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".apr/cache/hf")
+                    .join(input)
+                    .join("config.json");
+                if cache_base.exists() {
+                    return resolve_from_config_json(&cache_base);
+                }
+            }
+            // Try as family name or architecture
+            resolve_family(input)
+        })
+    });
+
+    let Some(family) = family else {
+        // Strip hf:// prefix for display, trim whitespace
+        let raw_input = code_or_family
+            .map(|s| s.strip_prefix("hf://").unwrap_or(s).trim())
+            .unwrap_or("(none)");
+        // Truncate long inputs to prevent terminal flooding
+        let input = if raw_input.len() > 80 {
+            &raw_input[..raw_input.floor_char_boundary(80)]
+        } else {
+            raw_input
+        };
+        let suffix = if raw_input.len() > 80 { "..." } else { "" };
+
+        if json {
+            let err = serde_json::json!({
+                "error": format!("Could not resolve kernel class for '{input}{suffix}'"),
+                "available_families": load_families().iter().map(|f| &f.family).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&err).unwrap_or_default());
+        } else {
+            eprintln!("Error: Could not resolve kernel class for '{input}{suffix}'");
+            eprintln!();
+            eprintln!("Available families:");
+            let families = load_families();
+            for f in &families {
+                eprintln!(
+                    "  {:<12} {} (Class {})",
+                    f.family,
+                    f.display_name,
+                    f.kernel_class.letter()
+                );
+            }
+            // Show common aliases
+            let aliases = family_aliases();
+            if !aliases.is_empty() {
+                eprintln!();
+                eprintln!("Also accepted (aliases):");
+                let mut shown: Vec<String> = Vec::new();
+                for (alias, _target) in aliases {
+                    if !shown.contains(&alias.to_string()) {
+                        shown.push(alias.to_string());
+                    }
+                }
+                // Show in groups of 8 per line
+                for chunk in shown.chunks(8) {
+                    eprintln!("  {}", chunk.join(", "));
+                }
+            }
+        }
+        std::process::exit(1);
+    };
+
+    // Extract config.json mapping if a file was provided or resolvable from HF cache
+    let config_mapping = file
+        .map(|p| {
+            let config_path = if p.extension().map_or(false, |e| e == "json") {
+                p.to_path_buf()
+            } else {
+                p.with_file_name("config.json")
+            };
+            extract_config_mapping(&config_path)
+        })
+        .or_else(|| {
+            code_or_family.and_then(|input| {
+                let input = input.strip_prefix("hf://").unwrap_or(input);
+                if input.contains('/') {
+                    let cache_path = dirs::home_dir()?
+                        .join(".apr/cache/hf")
+                        .join(input)
+                        .join("config.json");
+                    if cache_path.exists() {
+                        return Some(extract_config_mapping(&cache_path));
+                    }
+                }
+                // Also try if input is a direct path to config.json
+                let path = Path::new(input);
+                if path.exists() && path.extension().map_or(false, |e| e == "json") {
+                    return Some(extract_config_mapping(path));
+                }
+                None
+            })
+        })
+        .unwrap_or_default();
+
+    if json {
+        let output = build_json_output(&family, config_mapping, proof_status);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).unwrap_or_default()
+        );
+    } else {
+        print_human_output(&family, &config_mapping, verbose, proof_status);
+    }
+
     Ok(())
 }
 
@@ -311,27 +574,34 @@ fn explain_file(path: &Path) {
 mod tests {
     use super::*;
 
+    // Helper: call run() with default flags (no kernel/json/verbose/proof)
+    fn run_default(
+        code_or_file: Option<String>,
+        file: Option<PathBuf>,
+        tensor: Option<&str>,
+    ) -> Result<()> {
+        run(code_or_file, file, tensor, false, false, false, false)
+    }
+
     // ========================================================================
     // Error Code Explanation Tests
     // ========================================================================
 
     #[test]
     fn test_explain_known_error_code_e002() {
-        // E002 is explicitly handled
-        let result = run(Some("E002".to_string()), None, None);
+        let result = run_default(Some("E002".to_string()), None, None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_explain_unknown_error_code() {
-        // Unknown error codes should list available codes
-        let result = run(Some("E999".to_string()), None, None);
+        let result = run_default(Some("E999".to_string()), None, None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_explain_error_code_e001() {
-        let result = run(Some("E001".to_string()), None, None);
+        let result = run_default(Some("E001".to_string()), None, None);
         assert!(result.is_ok());
     }
 
@@ -341,13 +611,13 @@ mod tests {
 
     #[test]
     fn test_explain_known_tensor() {
-        let result = run(None, None, Some("encoder.conv1.weight"));
+        let result = run_default(None, None, Some("encoder.conv1.weight"));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_explain_unknown_tensor() {
-        let result = run(None, None, Some("unknown.tensor"));
+        let result = run_default(None, None, Some("unknown.tensor"));
         assert!(result.is_ok());
     }
 
@@ -357,13 +627,13 @@ mod tests {
 
     #[test]
     fn test_explain_file() {
-        let result = run(None, Some(PathBuf::from("/path/to/model.apr")), None);
+        let result = run_default(None, Some(PathBuf::from("/path/to/model.apr")), None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_explain_file_with_gguf_extension() {
-        let result = run(None, Some(PathBuf::from("model.gguf")), None);
+        let result = run_default(None, Some(PathBuf::from("model.gguf")), None);
         assert!(result.is_ok());
     }
 
@@ -373,20 +643,66 @@ mod tests {
 
     #[test]
     fn test_explain_no_arguments() {
-        // Should print help message
-        let result = run(None, None, None);
+        let result = run_default(None, None, None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_explain_empty_code() {
-        let result = run(Some(String::new()), None, None);
+        let result = run_default(Some(String::new()), None, None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_explain_empty_tensor() {
-        let result = run(None, None, Some(""));
+        let result = run_default(None, None, Some(""));
+        assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Kernel Explanation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_explain_kernel_qwen2() {
+        // Should resolve and print kernel info (not fail)
+        let result = run(
+            Some("qwen2".to_string()),
+            None,
+            None,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_explain_kernel_json() {
+        let result = run(
+            Some("llama".to_string()),
+            None,
+            None,
+            true,
+            true,
+            false,
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_explain_kernel_verbose_proof() {
+        let result = run(
+            Some("gpt2".to_string()),
+            None,
+            None,
+            true,
+            false,
+            true,
+            true,
+        );
         assert!(result.is_ok());
     }
 }

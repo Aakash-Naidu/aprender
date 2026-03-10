@@ -1,4 +1,3 @@
-
 /// PMAT-237: Extract model file paths from an `ExtendedCommands` variant.
 ///
 /// Helper for `extract_model_paths` — handles the 19 variants that moved to
@@ -56,14 +55,11 @@ fn extract_model_paths(command: &Commands) -> Vec<PathBuf> {
         }
         Commands::Export { plan: true, .. } => vec![],
         Commands::Export { file, .. } => file.iter().cloned().collect(),
-        Commands::Serve { command } => match command {
-            ServeCommands::Run { file, .. } => vec![file.clone()],
-            ServeCommands::Plan { model, .. } => {
-                // HF URLs don't have local files to validate
-                let path = PathBuf::from(model);
-                if path.exists() { vec![path] } else { vec![] }
-            }
-        },
+        // GH-471: Serve is exempt from pre-dispatch contract validation.
+        // The model loader itself fails fast on corrupt files.
+        // Contract gate was loading 17 GB+ models just to check tensor counts —
+        // O(file_size) compute before serve even starts.
+        Commands::Serve { .. } => vec![],
         Commands::Trace { file, .. }
         | Commands::Convert { file, .. }
         | Commands::Check { file, .. } => vec![file.clone()],
@@ -73,8 +69,12 @@ fn extract_model_paths(command: &Commands) -> Vec<PathBuf> {
 
         Commands::Quantize { file, .. } => vec![file.clone()],
         Commands::ModelOps(ModelOpsCommands::Prune { file, .. }) => vec![file.clone()],
-        Commands::ModelOps(ModelOpsCommands::Distill { teacher, .. }) => teacher.iter().cloned().collect(),
-        Commands::ModelOps(ModelOpsCommands::Finetune { file, .. }) => file.iter().cloned().collect(),
+        Commands::ModelOps(ModelOpsCommands::Distill { teacher, .. }) => {
+            teacher.iter().cloned().collect()
+        }
+        Commands::ModelOps(ModelOpsCommands::Finetune { file, .. }) => {
+            file.iter().cloned().collect()
+        }
 
         Commands::Tui { file, .. } => file.iter().cloned().collect(),
         Commands::Import { source, .. } => {
@@ -126,7 +126,7 @@ fn validate_model_contract(paths: &[PathBuf]) -> Result<(), CliError> {
         if !matches!(ext.as_str(), "gguf" | "safetensors" | "apr") {
             continue;
         }
-        validate_single_model(&rosetta, path)?;
+        validate_single_model_metadata(&rosetta, path)?;
     }
     Ok(())
 }
@@ -143,7 +143,34 @@ fn validate_shard_index(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// ALB-099: Metadata-only validation for the contract gate.
+/// Checks tensor names/shapes/dtypes without dequantizing to f32.
+/// Full numerical validation (NaN/Inf) available via `apr qa`.
+/// Saves 8+ GB of heap allocations for GGUF models.
+fn validate_single_model_metadata(
+    rosetta: &aprender::format::rosetta::RosettaStone,
+    path: &Path,
+) -> Result<(), CliError> {
+    let report = rosetta.validate_metadata_only(path).map_err(|e| {
+        CliError::ValidationFailed(format!(
+            "Contract validation failed for {}: {e}",
+            path.display()
+        ))
+    })?;
+    if !report.is_valid {
+        return Err(CliError::ValidationFailed(format!(
+            "PMAT-237 CONTRACT VIOLATION: {} has 0 tensors (corrupt file?). \
+             Use 'apr qa {}' for details. Use --skip-contract to bypass.",
+            path.display(),
+            path.display(),
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a single model file against the tensor layout contract.
+/// Full validation including dequantization and NaN/Inf checks.
+#[allow(dead_code)]
 fn validate_single_model(
     rosetta: &aprender::format::rosetta::RosettaStone,
     path: &Path,

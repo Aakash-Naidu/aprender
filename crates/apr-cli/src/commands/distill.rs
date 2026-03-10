@@ -207,6 +207,77 @@ fn default_eval_steps() -> usize {
     100
 }
 
+// --- Text-based distillation config (GH-455, ALB-011) ---
+// Matches distill-30b.yaml schema for text-based synthetic data generation.
+// Separate from DistillYamlConfig (logit KD) because vocab mismatch prevents logit alignment.
+
+#[derive(Debug, Clone, Deserialize)]
+struct TextDistillConfig {
+    teacher: TextTeacherConfig,
+    #[serde(default)]
+    student: Option<TextStudentConfig>,
+    synthetic_data: SyntheticDataConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TextTeacherConfig {
+    model: String,
+    #[serde(default)]
+    tokenizer: Option<String>,
+    #[serde(default)]
+    precision: Option<String>,
+    #[serde(default = "default_gpu")]
+    gpu: bool,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: u32,
+    #[serde(default = "default_gen_temperature")]
+    temperature: f32,
+    #[serde(default = "default_top_p")]
+    top_p: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TextStudentConfig {
+    checkpoint: String,
+    tokenizer: String,
+    #[serde(default)]
+    config: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SyntheticDataConfig {
+    prompts: String,
+    output: String,
+    #[serde(default = "default_target_tokens")]
+    target_tokens: u64,
+    #[serde(default = "default_samples_per_prompt")]
+    samples_per_prompt: u32,
+    #[serde(default = "default_min_completion_tokens")]
+    min_completion_tokens: u32,
+}
+
+fn default_gpu() -> bool {
+    true
+}
+fn default_max_tokens() -> u32 {
+    256
+}
+fn default_gen_temperature() -> f32 {
+    0.8
+}
+fn default_top_p() -> f32 {
+    0.95
+}
+fn default_target_tokens() -> u64 {
+    500_000
+}
+fn default_samples_per_prompt() -> u32 {
+    1
+}
+fn default_min_completion_tokens() -> u32 {
+    10
+}
+
 impl DistillYamlConfig {
     fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -253,7 +324,6 @@ impl DistillYamlConfig {
         }
         Ok(())
     }
-
 }
 
 /// Distillation strategy
@@ -313,6 +383,40 @@ fn validate_optional_paths(student_path: Option<&Path>, data_path: Option<&Path>
     Ok(())
 }
 
+/// Print the distill run header (file-based mode).
+#[allow(clippy::too_many_arguments)]
+fn print_distill_header(
+    teacher_path: &Path,
+    student_path: Option<&Path>,
+    data_path: Option<&Path>,
+    distill_strategy: DistillStrategy,
+    temperature: f64,
+    alpha: f64,
+    epochs: u32,
+    out: &Path,
+    json_output: bool,
+) {
+    if !json_output {
+        output::header("APR Distill");
+        let mut pairs = vec![
+            ("Teacher", teacher_path.display().to_string()),
+            ("Strategy", format!("{distill_strategy:?}")),
+            ("Temperature", format!("{temperature:.1}")),
+            ("Alpha", format!("{alpha:.2}")),
+            ("Epochs", epochs.to_string()),
+            ("Output", out.display().to_string()),
+        ];
+        if let Some(student) = student_path {
+            pairs.insert(1, ("Student", student.display().to_string()));
+        }
+        if let Some(data) = data_path {
+            pairs.push(("Training data", data.display().to_string()));
+        }
+        println!("{}", output::kv_table(&pairs));
+        println!();
+    }
+}
+
 /// Run the distill command — dispatches between file-based and config-driven modes.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::disallowed_methods)]
@@ -335,7 +439,6 @@ pub(crate) fn run(
         return run_config_mode(config, stage, plan_only, json_output);
     }
 
-    // File-based mode (original): apr distill <teacher.apr> [--student ...]
     let teacher_path = teacher_path.ok_or_else(|| {
         CliError::ValidationFailed(
             "Teacher model path required. Use positional arg or --config <yaml>".to_string(),
@@ -347,7 +450,6 @@ pub(crate) fn run(
     }
 
     let distill_strategy: DistillStrategy = strategy.parse().map_err(CliError::ValidationFailed)?;
-
     validate_distill_params(temperature, alpha)?;
 
     if plan_only {
@@ -374,26 +476,17 @@ pub(crate) fn run(
         )
     })?;
 
-    if !json_output {
-        output::header("APR Distill");
-        let mut pairs = vec![
-            ("Teacher", teacher_path.display().to_string()),
-            ("Strategy", format!("{distill_strategy:?}")),
-            ("Temperature", format!("{temperature:.1}")),
-            ("Alpha", format!("{alpha:.2}")),
-            ("Epochs", epochs.to_string()),
-            ("Output", out.display().to_string()),
-        ];
-        if let Some(student) = student_path {
-            pairs.insert(1, ("Student", student.display().to_string()));
-        }
-        if let Some(data) = data_path {
-            pairs.push(("Training data", data.display().to_string()));
-        }
-        println!("{}", output::kv_table(&pairs));
-        println!();
-    }
-
+    print_distill_header(
+        teacher_path,
+        student_path,
+        data_path,
+        distill_strategy,
+        temperature,
+        alpha,
+        epochs,
+        out,
+        json_output,
+    );
     validate_optional_paths(student_path, data_path)?;
 
     if !json_output {
@@ -445,6 +538,20 @@ fn run_config_mode(
         return Err(CliError::FileNotFound(config_path.to_path_buf()));
     }
 
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| CliError::ValidationFailed(format!("Failed to read config: {e}")))?;
+
+    // Detect config type: text-based (has synthetic_data) vs logit KD (has distillation/dataset)
+    let raw: serde_json::Value = serde_yaml::from_str(&content)
+        .map_err(|e| CliError::ValidationFailed(format!("Failed to parse YAML: {e}")))?;
+
+    if raw.get("synthetic_data").is_some() {
+        let config: TextDistillConfig = serde_yaml::from_str(&content)
+            .map_err(|e| CliError::ValidationFailed(format!("Config error: {e}")))?;
+        return run_text_config_mode(&config, config_path, stage, plan_only, json_output);
+    }
+
+    // Original logit KD config
     let config = DistillYamlConfig::load(config_path)
         .map_err(|e| CliError::ValidationFailed(format!("Config error: {e}")))?;
 
@@ -469,6 +576,25 @@ fn run_config_mode(
     }
 }
 
+/// Text-based distillation config mode dispatch (GH-455).
+fn run_text_config_mode(
+    config: &TextDistillConfig,
+    config_path: &Path,
+    stage: Option<&str>,
+    _plan_only: bool,
+    json_output: bool,
+) -> Result<()> {
+    match stage {
+        Some("generate") => run_text_generate(config, config_path, json_output),
+        Some(other) => Err(CliError::ValidationFailed(format!(
+            "Unknown stage: {other}. Supported: generate"
+        ))),
+        None => Err(CliError::ValidationFailed(
+            "--stage generate required with text-based distillation config.".to_string(),
+        )),
+    }
+}
+
 /// Plan mode for config-driven distillation.
 /// Validates config, estimates resource usage, shows two-stage plan.
 #[allow(clippy::disallowed_methods)]
@@ -480,18 +606,38 @@ fn run_config_plan(
     let dataset_path = std::path::Path::new(&config.dataset.path);
     let dataset_exists = dataset_path.exists();
     let dataset_size = if dataset_exists {
-        std::fs::metadata(dataset_path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(dataset_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
     } else {
         0
     };
     let teacher_path = std::path::Path::new(&config.teacher.model_id);
     let teacher_exists = teacher_path.exists();
-    let teacher_size = if teacher_exists { dir_size(teacher_path) } else { 0 };
+    let teacher_size = if teacher_exists {
+        dir_size(teacher_path)
+    } else {
+        0
+    };
 
     if json_output {
-        print_config_plan_json(config, config_path, teacher_exists, teacher_size, dataset_exists, dataset_size);
+        print_config_plan_json(
+            config,
+            config_path,
+            teacher_exists,
+            teacher_size,
+            dataset_exists,
+            dataset_size,
+        );
     } else {
-        print_config_plan_text(config, config_path, teacher_exists, teacher_size, dataset_exists, dataset_size);
+        print_config_plan_text(
+            config,
+            config_path,
+            teacher_exists,
+            teacher_size,
+            dataset_exists,
+            dataset_size,
+        );
     }
     Ok(())
 }
@@ -545,7 +691,10 @@ fn print_config_plan_json(
         "stages": ["precompute", "train"],
         "verdict": if teacher_exists && dataset_exists { "ready" } else { "missing_dependencies" },
     });
-    println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json).unwrap_or_default()
+    );
 }
 
 /// Text output for config-driven plan.
@@ -571,19 +720,42 @@ fn print_config_plan_text(
 
     output::subheader("  Two-Stage Workflow");
     output::kv("    Output dir", &config.output.dir);
-    println!("    Stage 1: apr distill --config {} --stage precompute", config_path.display());
-    println!("             Extract teacher logits → {}/logits/", config.output.dir);
-    println!("    Stage 2: apr distill --config {} --stage train", config_path.display());
-    println!("             Train student with KD loss → {}/student/", config.output.dir);
+    println!(
+        "    Stage 1: apr distill --config {} --stage precompute",
+        config_path.display()
+    );
+    println!(
+        "             Extract teacher logits → {}/logits/",
+        config.output.dir
+    );
+    println!(
+        "    Stage 2: apr distill --config {} --stage train",
+        config_path.display()
+    );
+    println!(
+        "             Train student with KD loss → {}/student/",
+        config.output.dir
+    );
     println!();
 
     if teacher_exists && dataset_exists {
-        println!("  {} Config validated, ready for apply", "READY".green().bold());
+        println!(
+            "  {} Config validated, ready for apply",
+            "READY".green().bold()
+        );
     } else {
         let mut missing = Vec::new();
-        if !teacher_exists { missing.push("teacher model"); }
-        if !dataset_exists { missing.push("dataset"); }
-        println!("  {} Missing: {}", "WARN".yellow().bold(), missing.join(", "));
+        if !teacher_exists {
+            missing.push("teacher model");
+        }
+        if !dataset_exists {
+            missing.push("dataset");
+        }
+        println!(
+            "  {} Missing: {}",
+            "WARN".yellow().bold(),
+            missing.join(", ")
+        );
     }
 }
 
@@ -594,7 +766,14 @@ fn print_config_plan_teacher(config: &DistillYamlConfig, exists: bool, size: u64
     if exists {
         output::kv("    Size", humansize::format_size(size, humansize::BINARY));
     }
-    output::kv("    8-bit loading", if config.teacher.load_in_8bit { "yes" } else { "no" });
+    output::kv(
+        "    8-bit loading",
+        if config.teacher.load_in_8bit {
+            "yes"
+        } else {
+            "no"
+        },
+    );
     println!();
 }
 
@@ -610,7 +789,10 @@ fn print_config_plan_student(config: &DistillYamlConfig) {
 
 fn print_config_plan_distill(config: &DistillYamlConfig) {
     output::subheader("  Distillation");
-    output::kv("    Temperature", format!("{:.1}", config.distillation.temperature));
+    output::kv(
+        "    Temperature",
+        format!("{:.1}", config.distillation.temperature),
+    );
     output::kv("    Alpha", format!("{:.2}", config.distillation.alpha));
     if config.distillation.progressive.is_some() {
         output::kv("    Progressive", "enabled");
@@ -625,7 +807,10 @@ fn print_config_plan_training(config: &DistillYamlConfig) {
     output::subheader("  Training");
     output::kv("    Epochs", config.training.epochs.to_string());
     output::kv("    Batch size", config.training.batch_size.to_string());
-    output::kv("    Learning rate", format!("{:.2e}", config.training.learning_rate));
+    output::kv(
+        "    Learning rate",
+        format!("{:.2e}", config.training.learning_rate),
+    );
     if let Some(ref mp) = config.training.mixed_precision {
         output::kv("    Mixed precision", mp);
     }
@@ -639,7 +824,10 @@ fn print_config_plan_dataset(config: &DistillYamlConfig, exists: bool, size: u64
     if exists {
         output::kv("    Size", humansize::format_size(size, humansize::BINARY));
     }
-    output::kv("    Max seq length", config.dataset.max_seq_length.to_string());
+    output::kv(
+        "    Max seq length",
+        config.dataset.max_seq_length.to_string(),
+    );
     println!();
 }
 
@@ -819,9 +1007,12 @@ fn inspect_dir_files(
     let mut total_size = 0u64;
     for entry in entries.flatten() {
         let p = entry.path();
-        let is_model = p.extension().and_then(|e| e.to_str())
-            .map_or(false, |ext| matches!(ext, "safetensors" | "apr" | "gguf" | "bin"));
-        if !is_model { continue; }
+        let is_model = p.extension().and_then(|e| e.to_str()).map_or(false, |ext| {
+            matches!(ext, "safetensors" | "apr" | "gguf" | "bin")
+        });
+        if !is_model {
+            continue;
+        }
         total_tensors += rosetta.inspect(&p).map_or(0, |r| r.tensors.len());
         total_size += std::fs::metadata(&p).map_or(0, |m| m.len());
     }
@@ -933,10 +1124,7 @@ fn run_config_train(
             println!();
             output::kv("  Metadata", meta_path.display().to_string());
             println!();
-            println!(
-                "  {} Student training completed.",
-                "DONE".green().bold()
-            );
+            println!("  {} Student training completed.", "DONE".green().bold());
         }
     } else {
         if !json_output {
@@ -1265,6 +1453,332 @@ fn run_plan(
         println!(
             "  {} Run without --plan to execute.",
             output::badge_info("INFO"),
+        );
+    }
+
+    Ok(())
+}
+
+/// Stage: Generate synthetic data from teacher model (GH-455).
+///
+/// Spawns `realizar serve --model <teacher.apr> --gpu` as a subprocess,
+/// reads prompts from JSONL, generates completions via HTTP, writes output JSONL.
+#[allow(clippy::disallowed_methods)]
+fn run_text_generate(
+    config: &TextDistillConfig,
+    config_path: &Path,
+    json_output: bool,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader, BufWriter, Write};
+    use std::process::{Command, Stdio};
+
+    let teacher_path = std::path::Path::new(&config.teacher.model);
+    if !teacher_path.exists() {
+        return Err(CliError::FileNotFound(teacher_path.to_path_buf()));
+    }
+
+    let prompts_path = std::path::Path::new(&config.synthetic_data.prompts);
+    if !prompts_path.exists() {
+        return Err(CliError::FileNotFound(prompts_path.to_path_buf()));
+    }
+
+    if !json_output {
+        output::header("apr distill apply — Stage: Generate Synthetic Data (GH-455)");
+        println!();
+        output::kv("  Config", config_path.display().to_string());
+        output::kv("  Teacher", &config.teacher.model);
+        output::kv("  Prompts", &config.synthetic_data.prompts);
+        output::kv("  Output", &config.synthetic_data.output);
+        output::kv(
+            "  Max tokens/completion",
+            config.teacher.max_tokens.to_string(),
+        );
+        output::kv(
+            "  Temperature",
+            format!("{:.2}", config.teacher.temperature),
+        );
+        output::kv(
+            "  Target tokens",
+            config.synthetic_data.target_tokens.to_string(),
+        );
+        println!();
+    }
+
+    // Use apr serve run (sovereign stack) — spawn ourselves as subprocess
+    let apr_bin = std::env::current_exe().map_err(|e| {
+        CliError::ValidationFailed(format!("Cannot determine apr binary path: {e}"))
+    })?;
+
+    if !json_output {
+        output::pipeline_stage("Starting teacher server", output::StageStatus::Running);
+        output::kv("  Binary", apr_bin.display().to_string());
+    }
+
+    // Start `apr serve run <model> --gpu --port 8090` as subprocess
+    let mut server = Command::new(&apr_bin)
+        .args([
+            "serve",
+            "run",
+            &config.teacher.model,
+            "--gpu",
+            "--port",
+            "8090",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| CliError::ValidationFailed(format!("Failed to start apr serve: {e}")))?;
+
+    // Wait for server to be ready (up to 180s for 17 GB Q4K model load)
+    let base_url = "http://127.0.0.1:8090";
+    let health_url = format!("{base_url}/health");
+    let mut ready = false;
+    for attempt in 0..180 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Check if server process died
+        if let Ok(Some(status)) = server.try_wait() {
+            let _ = server.kill();
+            return Err(CliError::ValidationFailed(format!(
+                "apr serve exited with status {status} during startup"
+            )));
+        }
+
+        match ureq::get(&health_url).call() {
+            Ok(resp) if resp.status() == 200 => {
+                ready = true;
+                if !json_output {
+                    output::pipeline_stage("Starting teacher server", output::StageStatus::Done);
+                    output::kv("  Ready after", format!("{}s", attempt + 1));
+                    println!();
+                }
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    if !ready {
+        let _ = server.kill();
+        let _ = server.wait();
+        return Err(CliError::ValidationFailed(
+            "Teacher server did not become ready within 180 seconds".into(),
+        ));
+    }
+
+    // Read prompts from JSONL
+    let prompts_file = std::fs::File::open(prompts_path)?;
+    let reader = BufReader::new(prompts_file);
+    let mut prompts = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|e| CliError::ValidationFailed(format!("Invalid prompt JSONL: {e}")))?;
+        prompts.push(parsed);
+    }
+
+    if !json_output {
+        output::pipeline_stage("Generating completions", output::StageStatus::Running);
+        output::kv("  Loaded prompts", prompts.len().to_string());
+    }
+
+    // Resume support: load existing output to skip already-generated prompts
+    let output_path = std::path::Path::new(&config.synthetic_data.output);
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut existing_prompts = std::collections::HashSet::new();
+    let mut total_tokens = 0u64;
+    let mut generated_count = 0u64;
+    let mut skipped_count = 0u64;
+    if output_path.exists() {
+        let existing = std::fs::File::open(output_path)?;
+        for line in BufReader::new(existing).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(p) = parsed.get("prompt").and_then(|v| v.as_str()) {
+                    existing_prompts.insert(p.to_string());
+                }
+                total_tokens += parsed.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                generated_count += 1;
+            }
+        }
+        if !existing_prompts.is_empty() && !json_output {
+            println!(
+                "  Resuming: {} existing records, {} tokens",
+                existing_prompts.len(),
+                total_tokens
+            );
+        }
+    }
+    let output_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path)?;
+    let mut writer = BufWriter::new(output_file);
+
+    let generate_url = format!("{base_url}/generate");
+    let target = config.synthetic_data.target_tokens;
+    let start_time = std::time::Instant::now();
+
+    for (i, prompt_json) in prompts.iter().enumerate() {
+        if total_tokens >= target {
+            break;
+        }
+
+        let prompt_text = prompt_json
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                CliError::ValidationFailed(format!("Prompt {} missing 'prompt' field", i))
+            })?;
+
+        // Skip already-generated prompts (resume support)
+        if existing_prompts.contains(prompt_text) {
+            continue;
+        }
+
+        // POST to /generate endpoint (retry up to 3 times on server errors)
+        let mut resp = None;
+        for retry in 0..3 {
+            match ureq::post(&generate_url).send_json(serde_json::json!({
+                "prompt": prompt_text,
+                "max_tokens": config.teacher.max_tokens,
+                "temperature": config.teacher.temperature,
+                "strategy": "top_p",
+                "top_p": config.teacher.top_p,
+            })) {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) if retry < 2 => {
+                    if !json_output {
+                        eprintln!("  Retry {}/{} for prompt {}: {e}", retry + 1, 3, i);
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                Err(e) => {
+                    if !json_output {
+                        eprintln!("  Skipping prompt {} after 3 retries: {e}", i);
+                    }
+                    skipped_count += 1;
+                    continue;
+                }
+            }
+        }
+        let Some(resp) = resp else {
+            continue;
+        };
+
+        let gen_result: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| CliError::NetworkError(format!("Invalid generate response: {e}")))?;
+
+        let num_tokens = gen_result
+            .get("num_generated")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let text = gen_result
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if num_tokens < u64::from(config.synthetic_data.min_completion_tokens) {
+            skipped_count += 1;
+            continue;
+        }
+
+        // Write output JSONL record
+        let record = serde_json::json!({
+            "prompt": prompt_text,
+            "completion": text,
+            "tokens": num_tokens,
+            "source": prompt_json.get("source").and_then(|v| v.as_str()).unwrap_or(""),
+            "kind": prompt_json.get("kind").and_then(|v| v.as_str()).unwrap_or(""),
+        });
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&record)
+                .map_err(|e| CliError::ValidationFailed(format!("JSON serialize error: {e}")))?
+        )?;
+        writer.flush()?; // Flush after each record so output is visible immediately
+
+        total_tokens += num_tokens;
+        generated_count += 1;
+
+        // Progress every 10 prompts
+        if (i + 1) % 10 == 0 && !json_output {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let tok_per_sec = if elapsed > 0.0 {
+                total_tokens as f64 / elapsed
+            } else {
+                0.0
+            };
+            println!(
+                "  [{}/{}] {} tokens generated ({:.0} tok/s), {} skipped",
+                i + 1,
+                prompts.len(),
+                total_tokens,
+                tok_per_sec,
+                skipped_count
+            );
+        }
+    }
+
+    writer.flush()?;
+
+    // Shutdown server
+    let _ = server.kill();
+    let _ = server.wait();
+
+    let elapsed = start_time.elapsed();
+
+    if json_output {
+        let result = serde_json::json!({
+            "stage": "generate",
+            "status": "completed",
+            "prompts_total": prompts.len(),
+            "completions_generated": generated_count,
+            "completions_skipped": skipped_count,
+            "total_tokens": total_tokens,
+            "target_tokens": target,
+            "elapsed_seconds": elapsed.as_secs(),
+            "output": config.synthetic_data.output,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
+        use colored::Colorize;
+        output::pipeline_stage("Generating completions", output::StageStatus::Done);
+        println!();
+        output::kv("  Completions", generated_count.to_string());
+        output::kv("  Skipped", skipped_count.to_string());
+        output::kv("  Tokens", total_tokens.to_string());
+        output::kv("  Target", target.to_string());
+        output::kv("  Elapsed", format!("{:.0}s", elapsed.as_secs_f64()));
+        output::kv(
+            "  Throughput",
+            format!(
+                "{:.1} tok/s",
+                total_tokens as f64 / elapsed.as_secs_f64().max(0.001)
+            ),
+        );
+        output::kv("  Output", &config.synthetic_data.output);
+        println!();
+        println!(
+            "  {} Synthetic data generated. Tokenize and train next.",
+            "DONE".green().bold()
         );
     }
 

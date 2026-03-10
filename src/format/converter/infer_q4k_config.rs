@@ -78,6 +78,10 @@ fn build_q4k_metadata(cfg: &InferredQ4kConfig, param_count: u64) -> AprV2Metadat
         rope_theta: Some(1000000.0),          // Default for Qwen2
         rope_type: Some(2),                   // NEOX style for Qwen2 (PMAT-114)
         rms_norm_eps: Some(1e-6),             // Default for Qwen2
+        head_dim: None,
+        num_experts: None,
+        num_experts_per_tok: None,
+        moe_intermediate_size: None,
         custom: std::collections::HashMap::new(),
     }
 }
@@ -161,6 +165,13 @@ pub use export::{apr_export, ExportFormat, ExportOptions, ExportReport};
 // Merge functionality extracted to merge.rs (PMAT-197)
 mod merge;
 pub use merge::{apr_merge, MergeOptions, MergeReport, MergeStrategy};
+
+// Evolutionary merge optimization (GH-444)
+pub mod evolutionary_merge;
+pub use evolutionary_merge::{
+    evolutionary_merge as evolutionary_merge_fn, EvolutionaryMergeConfig,
+    EvolutionaryMergeResult,
+};
 // For tests
 
 // Tests extracted to tests.rs (PMAT-197)

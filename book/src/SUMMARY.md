@@ -216,6 +216,18 @@
 - [Case Study: Predator-Prey Optimization](./examples/predator-prey-optimization.md)
 - [Case Study: DataFrame Basics](./examples/dataframe-basics.md)
 - [Case Study: Data Preprocessing with Scalers](./examples/data-preprocessing-scalers.md)
+- [Case Study: PII Filtering for Fine-Tuning](./examples/pii-filtering.md)
+- [Case Study: Evolutionary Merge Optimization](./examples/evolutionary-merge.md)
+- [Case Study: Advanced Distillation Strategies](./examples/distillation-advanced.md)
+- [Case Study: Continual Pre-Training](./examples/continual-pretraining.md)
+- [Case Study: Direct Preference Optimization](./examples/dpo-preference.md)
+- [Case Study: Evaluation Harness](./examples/eval-harness.md)
+- [Case Study: Advanced Merge Strategies](./examples/advanced-merge.md)
+- [Case Study: Differentiable Adaptive Merging (DAM)](./examples/dam-merge.md)
+- [Case Study: RLVR (Verifiable Rewards)](./examples/rlvr.md)
+- [Case Study: MoE Construction](./examples/moe-construction.md)
+- [Case Study: Tokenizer Surgery](./examples/tokenizer-surgery.md)
+- [Case Study: Per-Layer Merge](./examples/per-layer-merge.md)
 - [Case Study: Graph Social Network](./examples/graph-social-network.md)
 - [Case Study: Community Detection with Louvain](./examples/community-detection.md)
 - [Case Study: Comprehensive Graph Algorithms](./examples/graph-algorithms-comprehensive.md)
@@ -294,6 +306,7 @@
 - [Case Study: Sharded SafeTensors Serving (GH-213)](./examples/sharded-safetensors-serve.md)
 - [Case Study: Model Merge Strategies (GH-245)](./examples/model-merge-strategies.md)
 - [Case Study: Qwen3.5 Hybrid Attention (GH-278)](./examples/qwen3.5-hybrid-attention.md)
+- [Case Study: cbtop Profiling Falsification (GH-420)](./examples/cbtop-profiling-falsification.md)
 
 # Sprint-Based Development
 
