@@ -746,9 +746,9 @@ include!("finetune_display_next_validate.rs");
 /// distributed training subsystem.
 fn build_distributed_config(
     role: Option<&str>,
-    _bind: Option<&str>,
-    _coordinator: Option<&str>,
-    _expect_workers: Option<usize>,
+    bind: Option<&str>,
+    coordinator: Option<&str>,
+    expect_workers: Option<usize>,
 ) -> Result<()> {
     if role.is_some() {
         return Err(CliError::ValidationFailed(
@@ -756,6 +756,18 @@ fn build_distributed_config(
              Use single-machine training for now."
                 .to_string(),
         ));
+    }
+    // GH-523: Warn when distributed flags are provided without --role
+    if bind.is_some() {
+        eprintln!("Warning: --bind requires --role for distributed training. Flag ignored.");
+    }
+    if coordinator.is_some() {
+        eprintln!("Warning: --coordinator requires --role for distributed training. Flag ignored.");
+    }
+    if expect_workers.is_some() {
+        eprintln!(
+            "Warning: --expect-workers requires --role for distributed training. Flag ignored."
+        );
     }
     Ok(())
 }
@@ -1016,7 +1028,7 @@ fn run_classify(
         entrenar::monitor::tui::TrainingStateWriter::new(&output_dir, &experiment_id, model_name);
     // Wire GPU telemetry into training state for `apr monitor`
     if let Some((ref name, mem)) = gpu_info {
-        writer.set_gpu(name, mem as f32 / 1e9);
+        writer.set_gpu(name, (mem as f64 / 1e9) as f32);
     }
     trainer.set_monitor_writer(writer);
 

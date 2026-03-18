@@ -18,17 +18,32 @@ pub(crate) fn run(
     format: OutputFormat,
     focus: ProfileFocus,
     detect_naive: bool,
-    _naive_threshold: f64,
-    _compare_hf: Option<&str>,
-    _energy: bool,
+    naive_threshold: f64,
+    compare_hf: Option<&str>,
+    energy: bool,
     perf_grade: bool,
-    _callgraph: bool,
-    _fail_on_naive: bool,
+    callgraph: bool,
+    fail_on_naive: bool,
     output_path: Option<&Path>,
     tokens: usize,
     ollama: bool,
     no_gpu: bool,
 ) -> Result<(), CliError> {
+    // GH-517: Warn on unimplemented profiler flags (suppress unused warnings)
+    let _ = naive_threshold;
+    if compare_hf.is_some() {
+        eprintln!("Warning: --compare-hf is not yet implemented. Flag ignored.");
+    }
+    if energy {
+        eprintln!("Warning: --energy profiling is not yet implemented. Flag ignored.");
+    }
+    if callgraph {
+        eprintln!("Warning: --callgraph is not yet implemented. Flag ignored.");
+    }
+    if fail_on_naive {
+        eprintln!("Warning: --fail-on-naive is not yet implemented. Flag ignored.");
+    }
+
     // Validate file exists
     if !path.exists() {
         return Err(CliError::FileNotFound(path.to_path_buf()));
@@ -55,12 +70,17 @@ pub(crate) fn run(
     let mut results = if no_gpu {
         profile_real_inference_cpu(path, 3, 10)?
     } else {
+        // PMAT-203: Skip parity gate for profiling — known false positive on CUDA 13.1 driver.
+        // The parity gate compares GPU/CPU logits and fails spuriously, but profiling
+        // only needs generation throughput, not parity verification.
+        std::env::set_var("SKIP_PARITY_GATE", "1");
+
         // Try GPU generation profiling first (full token generation, not just forward pass)
         match profile_gpu_generation(path, tokens, 3, 10) {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
                 if matches!(format, OutputFormat::Human) {
-                    output::warn("GPU profiling unavailable, falling back to CPU per-op profiling");
+                    output::warn(&format!("GPU profiling failed: {e}, falling back to CPU per-op profiling"));
                 }
                 profile_real_inference_cpu(path, 3, 10)?
             }
@@ -166,27 +186,30 @@ pub(crate) fn run_ci(
         return Err(CliError::FileNotFound(path.to_path_buf()));
     }
 
-    #[cfg(feature = "inference")]
-    let results = profile_real_inference_cpu(path, warmup, measure)?;
-
     #[cfg(not(feature = "inference"))]
     {
+        let _ = (format, assertions, warmup, measure);
         output::warn("Inference feature not enabled. Cannot run CI profiling.");
         return Err(CliError::ValidationFailed(
             "Requires --features inference".to_string(),
         ));
     }
 
-    // Build CI report with assertion checks
-    let report = CiProfileReport::from_results(&results, assertions);
+    #[cfg(feature = "inference")]
+    {
+        let results = profile_real_inference_cpu(path, warmup, measure)?;
 
-    // Output based on format
-    match format {
-        OutputFormat::Json => report.print_json(),
-        _ => report.print_human(),
+        // Build CI report with assertion checks
+        let report = CiProfileReport::from_results(&results, assertions);
+
+        // Output based on format
+        match format {
+            OutputFormat::Json => report.print_json(),
+            _ => report.print_human(),
+        }
+
+        Ok(report.passed)
     }
-
-    Ok(report.passed)
 }
 
 // ============================================================================

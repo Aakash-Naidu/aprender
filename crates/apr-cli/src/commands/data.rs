@@ -283,8 +283,8 @@ fn print_audit_report(r: &AuditResult) {
             "Valid labels",
             format!(
                 "{} ({:.1}%)  {} ({out_of_range} out of range 0..{num_classes})",
-                total - out_of_range,
-                (total - out_of_range) as f64 / total as f64 * 100.0,
+                total.saturating_sub(out_of_range),
+                total.saturating_sub(out_of_range) as f64 / total as f64 * 100.0,
                 "WARN".yellow(),
             ),
         );
@@ -487,7 +487,7 @@ pub(crate) fn run_audit(
         let report = serde_json::json!({
             "path": path.display().to_string(),
             "total_samples": total,
-            "num_classes": num_classes,
+            "num_classes": imbalance_report.distribution.counts.len(),
             "out_of_range_labels": out_of_range,
             "class_distribution": imbalance_report.distribution.counts,
             "imbalance_ratio": imbalance_report.metrics.imbalance_ratio,

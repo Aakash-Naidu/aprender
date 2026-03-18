@@ -14,6 +14,8 @@
 
 use crate::error::{CliError, Result};
 use crate::output;
+use aprender::format::v2::{AprV2Header, AprV2Metadata, HEADER_SIZE_V2};
+use std::io::{Read as _, Seek, SeekFrom};
 use std::path::Path;
 
 /// Pruning method selection
@@ -133,6 +135,13 @@ pub(crate) fn run(
     json_output: bool,
 ) -> Result<()> {
     let prune_method = validate_prune_params(file, method, target_ratio, sparsity)?;
+
+    // GH-513: Reject --calibration since calibration-aware pruning is not yet implemented
+    if calibration.is_some() {
+        return Err(CliError::ValidationFailed(
+            "--calibration is not yet implemented. Use magnitude or depth pruning without calibration data.".to_string(),
+        ));
+    }
 
     // Analyze mode
     if analyze_only {
@@ -412,8 +421,11 @@ fn run_analyze(file: &Path, method: PruneMethod, json_output: bool) -> Result<()
         .map_err(|e| CliError::ValidationFailed(format!("Cannot read model: {e}")))?
         .len();
 
-    // Estimate parameter count (assume Q4 ~ 0.5 bytes/param)
-    let estimated_params = file_size * 2;
+    // Read actual parameter count from model metadata (GH-499)
+    let estimated_params = read_param_count(file).unwrap_or_else(|_| {
+        // Fallback: estimate from file size assuming F32 (4 bytes/param)
+        file_size / 4
+    });
 
     if json_output {
         let json = serde_json::json!({
@@ -459,6 +471,30 @@ fn run_analyze(file: &Path, method: PruneMethod, json_output: bool) -> Result<()
     }
 
     Ok(())
+}
+
+/// Read param_count from APR v2 metadata header (GH-499)
+fn read_param_count(file: &Path) -> Result<u64> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(file).map_err(CliError::Io)?);
+    let mut header_bytes = [0u8; HEADER_SIZE_V2];
+    reader.read_exact(&mut header_bytes)?;
+    let header = AprV2Header::from_bytes(&header_bytes)
+        .map_err(|e| CliError::InvalidFormat(format!("Failed to parse header: {e}")))?;
+    if header.metadata_size > 0 {
+        reader
+            .seek(SeekFrom::Start(header.metadata_offset))
+            .map_err(CliError::Io)?;
+        let mut meta_bytes = vec![0u8; header.metadata_size as usize];
+        reader.read_exact(&mut meta_bytes)?;
+        if let Ok(meta) = AprV2Metadata::from_json(&meta_bytes) {
+            if meta.param_count > 0 {
+                return Ok(meta.param_count);
+            }
+        }
+    }
+    Err(CliError::ValidationFailed(
+        "No param_count in metadata".into(),
+    ))
 }
 
 include!("prune_include_01.rs");

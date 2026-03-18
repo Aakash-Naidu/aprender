@@ -254,6 +254,8 @@ struct SyntheticDataConfig {
     samples_per_prompt: u32,
     #[serde(default = "default_min_completion_tokens")]
     min_completion_tokens: u32,
+    #[serde(default = "default_max_prompt_chars")]
+    max_prompt_chars: usize,
 }
 
 fn default_gpu() -> bool {
@@ -276,6 +278,9 @@ fn default_samples_per_prompt() -> u32 {
 }
 fn default_min_completion_tokens() -> u32 {
     10
+}
+fn default_max_prompt_chars() -> usize {
+    2048
 }
 
 impl DistillYamlConfig {
@@ -581,9 +586,14 @@ fn run_text_config_mode(
     config: &TextDistillConfig,
     config_path: &Path,
     stage: Option<&str>,
-    _plan_only: bool,
+    plan_only: bool,
     json_output: bool,
 ) -> Result<()> {
+    // GH-504: Handle --plan for text-based configs
+    if plan_only {
+        return run_text_config_plan(config, config_path, json_output);
+    }
+
     match stage {
         Some("generate") => run_text_generate(config, config_path, json_output),
         Some(other) => Err(CliError::ValidationFailed(format!(
@@ -593,6 +603,80 @@ fn run_text_config_mode(
             "--stage generate required with text-based distillation config.".to_string(),
         )),
     }
+}
+
+/// Plan mode for text-based distillation (GH-504).
+#[allow(clippy::disallowed_methods)]
+fn run_text_config_plan(
+    config: &TextDistillConfig,
+    config_path: &Path,
+    json_output: bool,
+) -> Result<()> {
+    let prompts_path = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(&config.synthetic_data.prompts);
+    let prompt_count = if prompts_path.exists() {
+        std::fs::read_to_string(&prompts_path)
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let estimated_samples =
+        prompt_count as u64 * u64::from(config.synthetic_data.samples_per_prompt);
+    let estimated_tokens = estimated_samples * u64::from(config.teacher.max_tokens);
+
+    if json_output {
+        let json = serde_json::json!({
+            "plan": true,
+            "mode": "text-distillation",
+            "config": config_path.display().to_string(),
+            "teacher_model": config.teacher.model,
+            "prompts_file": config.synthetic_data.prompts,
+            "prompt_count": prompt_count,
+            "samples_per_prompt": config.synthetic_data.samples_per_prompt,
+            "estimated_samples": estimated_samples,
+            "target_tokens": config.synthetic_data.target_tokens,
+            "estimated_tokens": estimated_tokens,
+            "max_tokens_per_sample": config.teacher.max_tokens,
+            "temperature": config.teacher.temperature,
+            "output_dir": config.synthetic_data.output,
+            "stages": ["generate"],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_default()
+        );
+    } else {
+        output::header("APR Distill — Text Config Plan");
+        println!(
+            "{}",
+            output::kv_table(&[
+                ("Config", config_path.display().to_string()),
+                ("Teacher", config.teacher.model.clone()),
+                ("Prompts", config.synthetic_data.prompts.clone()),
+                ("Prompt count", format!("{prompt_count}")),
+                (
+                    "Samples/prompt",
+                    format!("{}", config.synthetic_data.samples_per_prompt),
+                ),
+                ("Est. samples", format!("{estimated_samples}")),
+                ("Est. tokens", format!("{estimated_tokens}")),
+                ("Output", config.synthetic_data.output.clone()),
+            ])
+        );
+        println!();
+        println!("  Stages:");
+        println!("    1. generate — Generate synthetic data from teacher");
+        println!();
+        println!(
+            "  {} Run with --stage generate to execute.",
+            output::badge_info("INFO")
+        );
+    }
+
+    Ok(())
 }
 
 /// Plan mode for config-driven distillation.
@@ -1644,16 +1728,35 @@ fn run_text_generate(
             continue;
         }
 
+        // ALB-111: Skip pathologically long prompts (55K char prompt caused hours-long prefill)
+        if prompt_text.len() > config.synthetic_data.max_prompt_chars {
+            if !json_output {
+                eprintln!(
+                    "  Skipping prompt {} ({} chars > {} max)",
+                    i,
+                    prompt_text.len(),
+                    config.synthetic_data.max_prompt_chars,
+                );
+            }
+            skipped_count += 1;
+            continue;
+        }
+
         // POST to /generate endpoint (retry up to 3 times on server errors)
         let mut resp = None;
+        let request_body = serde_json::to_string(&serde_json::json!({
+            "prompt": prompt_text,
+            "max_tokens": config.teacher.max_tokens,
+            "temperature": config.teacher.temperature,
+            "strategy": "top_p",
+            "top_p": config.teacher.top_p,
+        }))
+        .expect("JSON serialization cannot fail");
         for retry in 0..3 {
-            match ureq::post(&generate_url).send_json(serde_json::json!({
-                "prompt": prompt_text,
-                "max_tokens": config.teacher.max_tokens,
-                "temperature": config.teacher.temperature,
-                "strategy": "top_p",
-                "top_p": config.teacher.top_p,
-            })) {
+            match ureq::post(&generate_url)
+                .set("Content-Type", "application/json")
+                .send_string(&request_body)
+            {
                 Ok(r) => {
                     resp = Some(r);
                     break;
@@ -1677,9 +1780,13 @@ fn run_text_generate(
             continue;
         };
 
-        let gen_result: serde_json::Value = resp
-            .into_json()
-            .map_err(|e| CliError::NetworkError(format!("Invalid generate response: {e}")))?;
+        let gen_result: serde_json::Value = {
+            let body = resp.into_string().map_err(|e| {
+                CliError::NetworkError(format!("Failed to read response body: {e}"))
+            })?;
+            serde_json::from_str(&body)
+                .map_err(|e| CliError::NetworkError(format!("Invalid generate response: {e}")))?
+        };
 
         let num_tokens = gen_result
             .get("num_generated")

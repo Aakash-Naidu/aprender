@@ -72,6 +72,7 @@ fn extract_model_paths(command: &Commands) -> Vec<PathBuf> {
         Commands::ModelOps(ModelOpsCommands::Distill { teacher, .. }) => {
             teacher.iter().cloned().collect()
         }
+        #[cfg(feature = "training")]
         Commands::ModelOps(ModelOpsCommands::Finetune { file, .. }) => {
             file.iter().cloned().collect()
         }
@@ -414,14 +415,24 @@ fn dispatch_profile(
         };
         match profile::run_ci(file, output_format, &assertions, warmup, measure) {
             Ok(true) => Ok(()),
-            Ok(false) => {
-                std::process::exit(1);
-            }
+            Ok(false) => Err(CliError::ValidationFailed(
+                "CI profile assertions failed".to_string(),
+            )),
             Err(e) => Err(e),
         }
     } else if let Some(compare_path) = compare {
         // F-PROFILE-011: Cross-format performance comparison
-        profile::run_cross_format_comparison(file, compare_path, warmup, measure, tokens, no_gpu)
+        #[cfg(feature = "inference")]
+        {
+            profile::run_cross_format_comparison(file, compare_path, warmup, measure, tokens, no_gpu)
+        }
+        #[cfg(not(feature = "inference"))]
+        {
+            let _ = (compare_path, tokens, no_gpu);
+            Err(CliError::ValidationFailed(
+                "Cross-format comparison requires the 'inference' feature".to_string(),
+            ))
+        }
     } else {
         let profile_focus = focus
             .and_then(|f| f.parse().ok())

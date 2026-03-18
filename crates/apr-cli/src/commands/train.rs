@@ -251,7 +251,14 @@ fn patch_yaml_config(
         }
     }
 
-    let temp_path = std::env::temp_dir().join("apr-patched-config.yaml");
+    let temp_path = std::env::temp_dir().join(format!(
+        "apr-patched-config-{}-{}.yaml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let patched_yaml = serde_yaml::to_string(&yaml_val)
         .map_err(|e| CliError::ValidationFailed(format!("YAML serialize error: {e}")))?;
     std::fs::write(&temp_path, &patched_yaml)
@@ -389,11 +396,16 @@ struct WatchState {
 pub(crate) fn run_watch(
     config_path: &std::path::Path,
     max_restarts: usize,
-    _heartbeat_timeout: u64,
+    heartbeat_timeout: u64,
     backoff_initial: u64,
     backoff_max: u64,
     json_output: bool,
 ) -> Result<()> {
+    // GH-521: Warn that heartbeat timeout monitoring is not yet implemented
+    if heartbeat_timeout > 0 && !json_output {
+        eprintln!("Warning: --heartbeat-timeout is not yet implemented. Hang detection disabled.");
+    }
+
     if !config_path.exists() {
         return Err(CliError::FileNotFound(config_path.to_path_buf()));
     }
@@ -401,7 +413,7 @@ pub(crate) fn run_watch(
     print_watch_header(
         config_path,
         max_restarts,
-        _heartbeat_timeout,
+        heartbeat_timeout,
         backoff_initial,
         backoff_max,
         json_output,

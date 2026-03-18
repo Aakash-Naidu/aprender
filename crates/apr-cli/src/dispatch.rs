@@ -1,4 +1,3 @@
-
 /// Dispatch core commands (run, serve, inspection, format operations).
 ///
 /// Delegates to sub-dispatchers to keep cyclomatic complexity below 10 per function.
@@ -30,7 +29,8 @@ fn dispatch_core_command(cli: &Cli) -> Option<Result<(), CliError>> {
 /// Dispatch runtime commands: check, run, serve.
 fn dispatch_runtime_commands(cli: &Cli) -> Option<Result<(), CliError>> {
     Some(match cli.command.as_ref() {
-        Commands::Check { file, no_gpu, json } => commands::check::run(file, *no_gpu, *json),
+        Commands::Check { file, no_gpu, json } => crate::error::resolve_model_path(file)
+            .and_then(|r| commands::check::run(&r, *no_gpu, *json || cli.json)),
         Commands::Run {
             source,
             positional_prompt,
@@ -163,16 +163,18 @@ fn dispatch_diagnostic_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             payload,
             diff,
             interactive,
-        } => trace::run(
-            file,
-            layer.as_deref(),
-            reference.as_deref(),
-            *json || cli.json,
-            *verbose || cli.verbose,
-            *payload,
-            *diff,
-            *interactive,
-        ),
+        } => crate::error::resolve_model_path(file).and_then(|r| {
+            trace::run(
+                &r,
+                layer.as_deref(),
+                reference.as_deref(),
+                *json || cli.json,
+                *verbose || cli.verbose,
+                *payload,
+                *diff,
+                *interactive,
+            )
+        }),
 
         Commands::Tensors {
             file,
@@ -181,7 +183,12 @@ fn dispatch_diagnostic_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             limit,
             json,
         } => {
-            let (s, f, j, l) = (*stats, filter.as_deref().map(str::to_owned), *json || cli.json, *limit);
+            let (s, f, j, l) = (
+                *stats,
+                filter.as_deref().map(str::to_owned),
+                *json || cli.json,
+                *limit,
+            );
             crate::pipe::with_stdin_support(file, |p| tensors::run(p, s, f.as_deref(), j, l))
         }
 
@@ -194,16 +201,20 @@ fn dispatch_diagnostic_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             limit,
             transpose_aware,
             json,
-        } => diff::run(
-            file1,
-            file2,
-            *weights,
-            *values,
-            filter.as_deref(),
-            *limit,
-            *transpose_aware,
-            *json || cli.json,
-        ),
+        } => crate::error::resolve_model_path(file1).and_then(|r1| {
+            crate::error::resolve_model_path(file2).and_then(|r2| {
+                diff::run(
+                    &r1,
+                    &r2,
+                    *weights,
+                    *values,
+                    filter.as_deref(),
+                    *limit,
+                    *transpose_aware,
+                    *json || cli.json,
+                )
+            })
+        }),
 
         _ => return None,
     })
@@ -221,16 +232,25 @@ fn dispatch_format_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             batch,
             json,
             plan,
-        } => export::run(
-            file.as_deref(),
-            format,
-            output.as_deref(),
-            quantize.as_deref(),
-            *list_formats,
-            batch.as_deref(),
-            *json || cli.json,
-            *plan,
-        ),
+        } => {
+            match file
+                .as_ref()
+                .map(|f| crate::error::resolve_model_path(f))
+                .transpose()
+            {
+                Ok(resolved) => export::run(
+                    resolved.as_deref(),
+                    format,
+                    output.as_deref(),
+                    quantize.as_deref(),
+                    *list_formats,
+                    batch.as_deref(),
+                    *json || cli.json,
+                    *plan,
+                ),
+                Err(e) => Err(e),
+            }
+        }
         Commands::Import {
             source,
             output,
@@ -258,14 +278,16 @@ fn dispatch_format_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             compress,
             output,
             force,
-        } => convert::run(
-            file,
-            quantize.as_deref(),
-            compress.as_deref(),
-            output,
-            *force,
-            cli.json,
-        ),
+        } => crate::error::resolve_model_path(file).and_then(|r| {
+            convert::run(
+                &r,
+                quantize.as_deref(),
+                compress.as_deref(),
+                output,
+                *force,
+                cli.json,
+            )
+        }),
         Commands::Compile {
             file,
             output,
@@ -275,17 +297,26 @@ fn dispatch_format_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             strip,
             lto,
             list_targets,
-        } => compile::run(
-            file.as_deref(),
-            output.as_deref(),
-            target.as_deref(),
-            quantize.as_deref(),
-            *release,
-            *strip,
-            *lto,
-            *list_targets,
-            cli.json,
-        ),
+        } => {
+            match file
+                .as_ref()
+                .map(|f| crate::error::resolve_model_path(f))
+                .transpose()
+            {
+                Ok(resolved) => compile::run(
+                    resolved.as_deref(),
+                    output.as_deref(),
+                    target.as_deref(),
+                    quantize.as_deref(),
+                    *release,
+                    *strip,
+                    *lto,
+                    *list_targets,
+                    cli.json,
+                ),
+                Err(e) => Err(e),
+            }
+        }
         Commands::Quantize {
             file,
             scheme,
@@ -294,7 +325,18 @@ fn dispatch_format_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             batch,
             plan,
             force,
-        } => quantize::run(file, scheme, output.as_deref(), format.as_deref(), batch.as_deref(), *plan, *force, cli.json),
+        } => crate::error::resolve_model_path(file).and_then(|r| {
+            quantize::run(
+                &r,
+                scheme,
+                output.as_deref(),
+                format.as_deref(),
+                batch.as_deref(),
+                *plan,
+                *force,
+                cli.json,
+            )
+        }),
 
         _ => return None,
     })
@@ -313,8 +355,30 @@ fn dispatch_model_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             density,
             seed,
             plan,
-        } => merge::run(files, strategy, output, weights.clone(), base_model.clone(), *drop_rate, *density, *seed, cli.json, *plan),
-        Commands::Gpu { json } => gpu::run(*json),
+        } => {
+            let resolved: std::result::Result<Vec<std::path::PathBuf>, _> = files
+                .iter()
+                .map(|f| crate::error::resolve_model_path(f))
+                .collect();
+            match resolved {
+                Ok(r) => merge::run(
+                    &r,
+                    strategy,
+                    output.as_deref(),
+                    weights.clone(),
+                    base_model.clone(),
+                    *drop_rate,
+                    *density,
+                    *seed,
+                    cli.json,
+                    *plan,
+                ),
+                Err(e) => Err(e),
+            }
+        }
+        #[cfg(feature = "training")]
+        Commands::Gpu { json } => gpu::run(*json || cli.json),
+        #[cfg(feature = "training")]
         Commands::ModelOps(ModelOpsCommands::Finetune {
             file,
             method,
@@ -387,18 +451,20 @@ fn dispatch_model_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             analyze,
             plan,
             calibration,
-        }) => prune::run(
-            file,
-            method,
-            *target_ratio,
-            *sparsity,
-            output.as_deref(),
-            remove_layers.as_deref(),
-            *analyze,
-            *plan,
-            calibration.as_deref(),
-            cli.json,
-        ),
+        }) => crate::error::resolve_model_path(file).and_then(|r| {
+            prune::run(
+                &r,
+                method,
+                *target_ratio,
+                *sparsity,
+                output.as_deref(),
+                remove_layers.as_deref(),
+                *analyze,
+                *plan,
+                calibration.as_deref(),
+                cli.json,
+            )
+        }),
         Commands::ModelOps(ModelOpsCommands::Distill {
             teacher,
             student,

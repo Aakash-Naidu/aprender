@@ -53,11 +53,16 @@ fn decode_st_slice(
     start: usize,
     end: usize,
 ) -> Result<Vec<f32>, CliError> {
+    if start >= end {
+        return Err(CliError::InvalidFormat(format!(
+            "Invalid slice range: start ({start}) must be less than end ({end})"
+        )));
+    }
     match dtype {
         "F32" => {
             let byte_start = start * 4;
             let byte_end = end * 4;
-            if byte_end > tensor_bytes.len() {
+            if byte_start >= tensor_bytes.len() || byte_end > tensor_bytes.len() {
                 return Err(CliError::InvalidFormat("Slice exceeds tensor data".to_string()));
             }
             Ok(tensor_bytes[byte_start..byte_end]
@@ -68,7 +73,7 @@ fn decode_st_slice(
         "F16" => {
             let byte_start = start * 2;
             let byte_end = end * 2;
-            if byte_end > tensor_bytes.len() {
+            if byte_start >= tensor_bytes.len() || byte_end > tensor_bytes.len() {
                 return Err(CliError::InvalidFormat("Slice exceeds tensor data".to_string()));
             }
             Ok(tensor_bytes[byte_start..byte_end]
@@ -79,7 +84,7 @@ fn decode_st_slice(
         "BF16" => {
             let byte_start = start * 2;
             let byte_end = end * 2;
-            if byte_end > tensor_bytes.len() {
+            if byte_start >= tensor_bytes.len() || byte_end > tensor_bytes.len() {
                 return Err(CliError::InvalidFormat("Slice exceeds tensor data".to_string()));
             }
             Ok(tensor_bytes[byte_start..byte_end]
@@ -107,9 +112,14 @@ fn slice_gguf(
     let (data, shape) = get_gguf_tensor_f32(&opts.file, tensor_name)?;
     let num_elements = data.len();
 
-    if end > num_elements {
+    if start >= end {
         return Err(CliError::InvalidFormat(format!(
-            "Slice end {end} exceeds tensor size {num_elements}"
+            "Invalid slice range: start ({start}) must be less than end ({end})"
+        )));
+    }
+    if start >= num_elements || end > num_elements {
+        return Err(CliError::InvalidFormat(format!(
+            "Slice {start}:{end} exceeds tensor size {num_elements}"
         )));
     }
 
@@ -121,9 +131,8 @@ fn slice_gguf(
         .find(|t| t.name == tensor_name)
         .map_or("Unknown", |t| ggml_dtype_name(t.dtype));
 
-    let _ = shape; // shape available but not needed for flat slice
     let slice_count = end - start;
-    output_slice_result(opts, tensor_name, start, end, dtype_name, slice_count, &values)
+    output_slice_result(opts, tensor_name, start, end, dtype_name, slice_count, &shape, &values)
 }
 
 /// Slice extraction for APR format.
@@ -144,19 +153,27 @@ fn slice_apr(
     })?;
 
     let num_elements = data.len();
-    if end > num_elements {
+    if start >= end {
         return Err(CliError::InvalidFormat(format!(
-            "Slice end {end} exceeds tensor size {num_elements}"
+            "Invalid slice range: start ({start}) must be less than end ({end})"
+        )));
+    }
+    if start >= num_elements || end > num_elements {
+        return Err(CliError::InvalidFormat(format!(
+            "Slice {start}:{end} exceeds tensor size {num_elements}"
         )));
     }
 
     let values: Vec<f32> = data[start..end].to_vec();
-    let dtype_name = reader
-        .get_tensor(tensor_name)
+    let entry = reader.get_tensor(tensor_name);
+    let dtype_name = entry
+        .as_ref()
         .map_or_else(|| "Unknown".to_string(), |e| format!("{:?}", e.dtype));
+    let shape: Vec<usize> = entry
+        .map_or_else(Vec::new, |e| e.shape.clone());
 
     let slice_count = end - start;
-    output_slice_result(opts, tensor_name, start, end, &dtype_name, slice_count, &values)
+    output_slice_result(opts, tensor_name, start, end, &dtype_name, slice_count, &shape, &values)
 }
 
 /// Output slice result as JSON or text.
@@ -168,6 +185,7 @@ fn output_slice_result(
     end: usize,
     dtype: &str,
     count: usize,
+    original_shape: &[usize],
     values: &[f32],
 ) -> Result<(), CliError> {
     if opts.json {
@@ -175,7 +193,8 @@ fn output_slice_result(
             "tensor": tensor_name,
             "slice": format!("{start}:{end}"),
             "dtype": dtype,
-            "shape": [count],
+            "shape": original_shape,
+            "slice_count": count,
             "values": values,
         });
         if let Ok(s) = serde_json::to_string_pretty(&json) {

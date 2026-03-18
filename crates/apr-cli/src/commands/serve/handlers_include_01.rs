@@ -100,7 +100,7 @@ fn start_apr_server_gpu(
 ///   - Pool allocator: single cuMemAlloc for all tensors (~17 GB)
 ///   - Dedicated thread: CudaExecutor is !Send, owns GPU context
 ///   - Channel-based: HTTP handler → mpsc → inference thread → oneshot → response
-#[cfg(all(feature = "inference", feature = "cuda"))]
+#[cfg(all(feature = "inference", feature = "cuda-batch"))]
 fn start_apr_q4k_server_gpu(
     model_path: &Path,
     config: &ServerConfig,
@@ -114,30 +114,34 @@ fn start_apr_q4k_server_gpu(
     let model_str = model_path.to_string_lossy();
 
     // Load tokenizer from sibling file or embedded metadata
+    // ALB-109: Capture EOS token ID — Qwen3 uses 151643, not 0/2
     eprintln!("[GH-471] Loading tokenizer...");
-    let vocab = AprV2Model::load_tokenizer_from_sibling(model_path)
-        .map(|(v, _, _)| v)
+    let (vocab, eos_id) = AprV2Model::load_tokenizer_from_sibling(model_path)
+        .map(|(v, _, eos)| (v, eos))
         .or_else(|| {
             AprV2Model::load(model_path)
                 .ok()
                 .and_then(|m| m.load_embedded_tokenizer())
-                .map(|t| t.id_to_token.clone())
+                .map(|t| (t.id_to_token.clone(), None))
         })
         .unwrap_or_else(|| {
             println!(
                 "{}",
                 "Warning: No vocabulary found, using placeholder tokens".yellow()
             );
-            (0..151936).map(|i| format!("token{i}")).collect()
+            ((0..151936).map(|i| format!("token{i}")).collect(), None)
         });
 
     println!("  Vocab: {} tokens", vocab.len());
+    if let Some(eos) = eos_id {
+        println!("  EOS token ID: {eos}");
+    }
 
     // Spawn Q4K inference thread (loads model, uploads weights to GPU via pool allocator)
     let q4k_tx = apr_q4k_scheduler::spawn_apr_q4k_inference_thread(&model_str)
         .map_err(|e| CliError::InferenceFailed(format!("Q4K inference thread failed: {e}")))?;
 
-    let state = AppState::with_apr_q4k_and_vocab(q4k_tx, vocab)
+    let state = AppState::with_apr_q4k_and_vocab_eos(q4k_tx, vocab, eos_id)
         .map_err(|e| CliError::InferenceFailed(format!("Failed to create state: {e}")))?
         .with_verbose(config.verbose);
 
@@ -145,6 +149,17 @@ fn start_apr_q4k_server_gpu(
 
     let app = create_router(state);
     run_server_async(app, &config.bind_addr(), "APR GPU (Q4K CUDA — ALB-095)")
+}
+
+/// Stub: Q4K batch scheduler requires cuda-batch feature (realizar >=0.9).
+#[cfg(all(feature = "inference", feature = "cuda", not(feature = "cuda-batch")))]
+fn start_apr_q4k_server_gpu(
+    _model_path: &Path,
+    _config: &ServerConfig,
+) -> Result<()> {
+    Err(CliError::InferenceFailed(
+        "Q4K batch scheduler not available (build without cuda-batch feature)".to_string(),
+    ))
 }
 
 /// GH-88 / F-KERNEL-DISPATCH-001: SafeTensors GPU serve using fused Q4K kernels.

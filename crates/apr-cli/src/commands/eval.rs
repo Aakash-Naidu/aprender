@@ -486,6 +486,7 @@ fn resolve_checkpoint_dir(dir: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(feature = "training")]
 /// Run classification evaluation on a checkpoint directory.
 ///
 /// Loads a saved ClassifyPipeline checkpoint, evaluates against a JSONL test set,
@@ -1103,7 +1104,10 @@ where
                     }
                 }
             }
-            Err(_) if sample_idx == 0 => break,
+            Err(_e) if sample_idx == 0 => {
+                eprintln!("  Inference failed (falling back to structural validation)");
+                break;
+            }
             Err(_) => {}
         }
     }
@@ -1299,15 +1303,28 @@ fn run_humaneval_inference(
     _k_values: &[usize],
     json_output: bool,
 ) -> std::result::Result<(usize, Vec<(String, String, bool)>), String> {
-    use realizar::apr_transformer::AprKVCache;
+    use realizar::apr_transformer::{AprKVCache, AprTransformer};
     use realizar::safetensors_infer::SafetensorsToAprConverter;
 
-    // Load model
+    // Load model — try APR format first, fall back to SafeTensors
     if !json_output {
         println!("  {} Loading model for inference...", "→".dimmed());
     }
-    let transformer = SafetensorsToAprConverter::convert(model_path)
-        .map_err(|e| format!("Cannot load model: {e}"))?;
+    let transformer: AprTransformer = if model_path.extension().is_some_and(|e| e == "apr")
+        || model_path.join("model-best.apr").exists()
+    {
+        let apr_path = if model_path.is_dir() {
+            model_path.join("model-best.apr")
+        } else {
+            model_path.to_path_buf()
+        };
+        AprTransformer::from_apr_file(&apr_path)
+            .map_err(|e| format!("Cannot load APR model: {e}"))?
+    } else {
+        SafetensorsToAprConverter::convert(model_path)
+            .map_err(|e| format!("Cannot load model: {e}"))?
+            .into_inner()
+    };
 
     // Load tokenizer
     let tokenizer = realizar::apr::AprV2Model::load_tokenizer(model_path)
@@ -1426,6 +1443,7 @@ fn run_humaneval_inference(
 // --- ALB-089: GPU-accelerated inference for eval ---
 
 /// Load TransformerConfig from checkpoint dir's config.json.
+#[cfg(all(feature = "cuda", feature = "training"))]
 fn load_transformer_config(
     checkpoint_dir: &Path,
 ) -> std::result::Result<entrenar::transformer::TransformerConfig, String> {
@@ -1458,14 +1476,21 @@ fn load_transformer_config(
 ///
 /// Uses `forward_logits()` for autoregressive generation. No KV cache — each step
 /// reprocesses the full sequence. Still 20-40x faster than CPU for 350M model.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "training"))]
 fn run_humaneval_inference_cuda(
     model_path: &Path,
     problems: &[HumanEvalProblem],
     _k_values: &[usize],
     json_output: bool,
 ) -> std::result::Result<(usize, Vec<(String, String, bool)>), String> {
-    let config = load_transformer_config(model_path)?;
+    // ALB-089: resolve to checkpoint directory (model_path may be a .apr file)
+    let checkpoint_dir = if model_path.is_file() {
+        model_path.parent().unwrap_or(model_path)
+    } else {
+        model_path
+    };
+
+    let config = load_transformer_config(checkpoint_dir)?;
     let max_seq = config.max_position_embeddings;
 
     if !json_output {
@@ -1475,12 +1500,18 @@ fn run_humaneval_inference_cuda(
         );
     }
 
-    let mut trainer = entrenar::train::CudaTransformerTrainer::for_inference(model_path, config)
-        .map_err(|e| format!("CUDA inference init failed: {e}"))?;
+    let mut trainer =
+        entrenar::train::CudaTransformerTrainer::for_inference(checkpoint_dir, config)
+            .map_err(|e| format!("CUDA inference init failed: {e}"))?;
 
-    // Load tokenizer
+    // Load tokenizer — use original model_path (file) for sibling lookup
     let tokenizer = realizar::apr::AprV2Model::load_tokenizer(model_path)
-        .ok_or_else(|| "No tokenizer found in checkpoint dir".to_string())?;
+        .or_else(|| {
+            // Fallback: try tokenizer.json directly in checkpoint dir
+            let tok_path = checkpoint_dir.join("tokenizer.json");
+            realizar::apr::AprV2Model::load_tokenizer_from_path(&tok_path)
+        })
+        .ok_or_else(|| format!("No tokenizer found in {}", checkpoint_dir.display()))?;
 
     if !json_output {
         println!("  {} GPU inference ready", "✓".green());
@@ -1557,7 +1588,7 @@ fn run_humaneval_inference_cuda(
     Ok((passed, results))
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(all(feature = "cuda", feature = "training")))]
 fn run_humaneval_inference_cuda(
     _model_path: &Path,
     _problems: &[HumanEvalProblem],
@@ -1855,14 +1886,27 @@ fn run_mbpp_inference(
     _k_values: &[usize],
     json_output: bool,
 ) -> std::result::Result<(usize, Vec<(String, String, bool)>), String> {
-    use realizar::apr_transformer::AprKVCache;
+    use realizar::apr_transformer::{AprKVCache, AprTransformer};
     use realizar::safetensors_infer::SafetensorsToAprConverter;
 
     if !json_output {
         println!("  {} Loading model for inference...", "→".dimmed());
     }
-    let transformer = SafetensorsToAprConverter::convert(model_path)
-        .map_err(|e| format!("Cannot load model: {e}"))?;
+    let transformer: AprTransformer = if model_path.extension().is_some_and(|e| e == "apr")
+        || model_path.join("model-best.apr").exists()
+    {
+        let apr_path = if model_path.is_dir() {
+            model_path.join("model-best.apr")
+        } else {
+            model_path.to_path_buf()
+        };
+        AprTransformer::from_apr_file(&apr_path)
+            .map_err(|e| format!("Cannot load APR model: {e}"))?
+    } else {
+        SafetensorsToAprConverter::convert(model_path)
+            .map_err(|e| format!("Cannot load model: {e}"))?
+            .into_inner()
+    };
 
     let tokenizer = realizar::apr::AprV2Model::load_tokenizer(model_path)
         .ok_or_else(|| "No tokenizer found".to_string())?;
@@ -1974,14 +2018,21 @@ fn run_mbpp_inference(
 }
 
 /// GPU-accelerated MBPP inference via entrenar CudaTransformerTrainer (ALB-089).
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", feature = "training"))]
 fn run_mbpp_inference_cuda(
     model_path: &Path,
     problems: &[MbppProblem],
     _k_values: &[usize],
     json_output: bool,
 ) -> std::result::Result<(usize, Vec<(String, String, bool)>), String> {
-    let config = load_transformer_config(model_path)?;
+    // ALB-089: resolve to checkpoint directory (model_path may be a .apr file)
+    let checkpoint_dir = if model_path.is_file() {
+        model_path.parent().unwrap_or(model_path)
+    } else {
+        model_path
+    };
+
+    let config = load_transformer_config(checkpoint_dir)?;
     let max_seq = config.max_position_embeddings;
 
     if !json_output {
@@ -1991,11 +2042,16 @@ fn run_mbpp_inference_cuda(
         );
     }
 
-    let mut trainer = entrenar::train::CudaTransformerTrainer::for_inference(model_path, config)
-        .map_err(|e| format!("CUDA inference init failed: {e}"))?;
+    let mut trainer =
+        entrenar::train::CudaTransformerTrainer::for_inference(checkpoint_dir, config)
+            .map_err(|e| format!("CUDA inference init failed: {e}"))?;
 
     let tokenizer = realizar::apr::AprV2Model::load_tokenizer(model_path)
-        .ok_or_else(|| "No tokenizer found in checkpoint dir".to_string())?;
+        .or_else(|| {
+            let tok_path = checkpoint_dir.join("tokenizer.json");
+            realizar::apr::AprV2Model::load_tokenizer_from_path(&tok_path)
+        })
+        .ok_or_else(|| format!("No tokenizer found in {}", checkpoint_dir.display()))?;
 
     if !json_output {
         println!("  {} GPU inference ready", "✓".green());
@@ -2071,7 +2127,7 @@ fn run_mbpp_inference_cuda(
     Ok((passed, results))
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(all(feature = "cuda", feature = "training")))]
 fn run_mbpp_inference_cuda(
     _model_path: &Path,
     _problems: &[MbppProblem],
@@ -2896,8 +2952,17 @@ pub(crate) fn run_encrypt(
     input_path: &Path,
     output_path: &Path,
     key_file: Option<&Path>,
+    force: bool,
     json_output: bool,
 ) -> Result<()> {
+    // GH-509: Overwrite protection
+    if output_path.exists() && !force {
+        return Err(CliError::ValidationFailed(format!(
+            "Output file '{}' already exists. Use --force to overwrite.",
+            output_path.display()
+        )));
+    }
+
     let start = Instant::now();
 
     let key = derive_encryption_key(key_file)?;
@@ -2972,8 +3037,17 @@ pub(crate) fn run_decrypt(
     input_path: &Path,
     output_path: &Path,
     key_file: Option<&Path>,
+    force: bool,
     json_output: bool,
 ) -> Result<()> {
+    // GH-509: Overwrite protection
+    if output_path.exists() && !force {
+        return Err(CliError::ValidationFailed(format!(
+            "Output file '{}' already exists. Use --force to overwrite.",
+            output_path.display()
+        )));
+    }
+
     let start = Instant::now();
 
     let key = derive_encryption_key(key_file)?;
@@ -3004,9 +3078,14 @@ pub(crate) fn run_decrypt(
         println!();
     }
 
-    // Verify MAC
+    // Verify MAC (constant-time comparison to prevent timing side-channel)
     let computed_mac = compute_mac(&key, &nonce, encrypted);
-    if computed_mac.as_bytes() != &stored_mac {
+    let mac_ok = computed_mac
+        .as_bytes()
+        .iter()
+        .zip(stored_mac.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if mac_ok != 0 {
         return Err(CliError::ValidationFailed(
             "MAC verification failed — wrong key or corrupted file".to_string(),
         ));
@@ -3062,13 +3141,24 @@ fn derive_encryption_key(key_file: Option<&Path>) -> Result<[u8; 32]> {
             Ok(blake3::derive_key("albor model encryption 2026", &key_data))
         }
     } else {
-        // Read passphrase from environment or use default context
-        let passphrase = std::env::var("ALBOR_ENCRYPT_KEY").unwrap_or_else(|_| {
-            eprintln!("Enter passphrase (or set ALBOR_ENCRYPT_KEY env var):");
-            let mut input = String::new();
-            let _ = std::io::stdin().read_line(&mut input);
-            input.trim().to_string()
-        });
+        // Read passphrase from environment or stdin
+        let passphrase = match std::env::var("ALBOR_ENCRYPT_KEY") {
+            Ok(key) => key,
+            Err(_) => {
+                eprintln!("Enter passphrase (or set ALBOR_ENCRYPT_KEY env var):");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).map_err(|e| {
+                    CliError::ValidationFailed(format!("Failed to read passphrase from stdin: {e}"))
+                })?;
+                let trimmed = input.trim().to_string();
+                if trimmed.is_empty() {
+                    return Err(CliError::ValidationFailed(
+                        "Empty passphrase — aborting. Set ALBOR_ENCRYPT_KEY or provide a non-empty passphrase.".to_string(),
+                    ));
+                }
+                trimmed
+            }
+        };
         Ok(blake3::derive_key(
             "albor model encryption 2026",
             passphrase.as_bytes(),
