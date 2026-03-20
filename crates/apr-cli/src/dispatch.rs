@@ -42,7 +42,7 @@ fn dispatch_runtime_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             task,
             format,
             no_gpu,
-            gpu: _,
+            gpu,
             offline,
             benchmark,
             trace,
@@ -52,9 +52,28 @@ fn dispatch_runtime_commands(cli: &Cli) -> Option<Result<(), CliError>> {
             trace_level,
             trace_payload,
             profile,
+            temperature,
+            top_k,
             chat,
+            batch_jsonl,
             verbose,
         } => {
+            // GH-326: --gpu overrides --no-gpu when both specified
+            let effective_no_gpu = if *gpu { false } else { *no_gpu };
+
+            // Batch JSONL mode: load model once, process all prompts
+            if let Some(ref batch_file) = batch_jsonl {
+                return Some(run::run_batch(
+                    source,
+                    batch_file,
+                    *max_tokens,
+                    *temperature,
+                    *top_k,
+                    effective_no_gpu,
+                    *verbose || cli.verbose,
+                ));
+            }
+
             // GH-240: merge global --json flag into output format
             let effective_format = if cli.json { "json" } else { format.as_str() };
             dispatch_run(
@@ -67,7 +86,7 @@ fn dispatch_runtime_commands(cli: &Cli) -> Option<Result<(), CliError>> {
                 language.as_deref(),
                 task.as_deref(),
                 effective_format,
-                *no_gpu,
+                effective_no_gpu,
                 *offline,
                 *benchmark,
                 *verbose || cli.verbose,

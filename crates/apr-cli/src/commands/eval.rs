@@ -2307,10 +2307,11 @@ fn compute_ngram_overlap(
 pub(crate) fn run_compare(
     model_a: &Path,
     model_b: Option<&Path>,
-    _data_path: Option<&Path>,
+    data_path: Option<&Path>,
     json_output: bool,
 ) -> Result<()> {
-    let model_b = model_b.ok_or_else(|| {
+    // GH-525: Use --data as second model if model_b not provided positionally
+    let model_b = model_b.or(data_path).ok_or_else(|| {
         CliError::ValidationFailed(
             "--data <model_b.safetensors> is required as second model for comparison.\n\
              Usage: apr eval <model_a> --task compare --data <model_b>"
@@ -2726,8 +2727,18 @@ pub(crate) fn run_correlation(
 }
 
 /// Collect (ppl, benchmark_score) pairs from experiment logs.
-fn collect_ppl_benchmark_pairs(dir: &Path, _data_path: Option<&Path>) -> Result<Vec<(f64, f64)>> {
+fn collect_ppl_benchmark_pairs(dir: &Path, data_path: Option<&Path>) -> Result<Vec<(f64, f64)>> {
     let mut pairs = Vec::new();
+
+    // GH-527: Strategy 0: Use explicit --data path if provided
+    if let Some(dp) = data_path {
+        if dp.exists() {
+            let explicit_pairs = collect_from_jsonl_logs(dp)?;
+            if !explicit_pairs.is_empty() {
+                return Ok(explicit_pairs);
+            }
+        }
+    }
 
     // Strategy 1: scan JSONL experiment logs
     pairs.extend(collect_from_jsonl_logs(dir)?);

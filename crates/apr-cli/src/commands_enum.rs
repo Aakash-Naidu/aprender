@@ -69,6 +69,18 @@ pub enum Commands {
         /// Format: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
         #[arg(long)]
         chat: bool,
+        /// Sampling temperature (0.0 = greedy, default: 0.0)
+        #[arg(long, default_value = "0.0")]
+        temperature: f32,
+        /// Top-k sampling (default: 1 = greedy)
+        #[arg(long, default_value = "1")]
+        top_k: usize,
+        /// Batch mode: read prompts from JSONL, output results as JSONL.
+        /// Model loads once, processes all prompts sequentially.
+        /// Each input line: {"prompt": "...", "task_id": "..."}
+        /// Chat template is applied automatically.
+        #[arg(long, value_name = "FILE")]
+        batch_jsonl: Option<PathBuf>,
         /// Show verbose output (model loading, backend info)
         #[arg(short, long)]
         verbose: bool,
